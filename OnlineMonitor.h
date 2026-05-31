@@ -21,6 +21,7 @@
 #include <TGMenu.h>
 #include <TGTextEntry.h>
 #include <TH1F.h>
+#include <TH2F.h>
 #include <TROOT.h>
 #include <TRootEmbeddedCanvas.h>
 #include <TSystem.h>
@@ -88,6 +89,14 @@ namespace corryvreckan {
 
         // Timeline profiles (filled in run())
         TProfile* profile_tracks_ = nullptr;
+        int timelineNBins_;
+
+        // Telescope view histograms and detector z positions
+        TH2F* telescopeHitXZ_ = nullptr;
+        TH2F* telescopeHitYZ_ = nullptr;
+        std::vector<double> telescopeDetZ_;
+        int telescopeResetTracks_ = 0;
+        int telescopeTrackCount_ = 0;
 
         // Progress bar
         int targetEvents_;
@@ -119,10 +128,22 @@ namespace corryvreckan {
         std::map<std::string, int> planeEventAccum_;
         std::map<std::string, double> planeHitRate_;
 
+        // Warning mode — low cluster/event or track/event
+        double warningMinClustersPerEvent_;
+        double warningMinTracksPerEvent_;
+        int warningDuration_;
+        bool warningModeActive_ = false;
+        bool warningInitiated_ = false;
+        std::chrono::steady_clock::time_point warningBelowSince_;
+        std::map<std::string, int> warnClusterAccum_;
+        int warnTrackAccum_ = 0;
+        int warnEventAccum_ = 0;
+
         // Additional methods
         void gui_run();
         void gui_update();
         void fillTimeline(const std::shared_ptr<Clipboard>& clipboard);
+        void fillCorrelation(const std::shared_ptr<Clipboard>& clipboard);
         void checkDiscordAlert();
         void sendDiscordAlert();
         void sendDiscordRecovery();
@@ -130,6 +151,18 @@ namespace corryvreckan {
         void sendPlaneAlert(const std::string& detName, double rate, bool isHigh);
         void sendPlaneRecovery(const std::string& detName, double rate);
         void sendDiscordPayload(const std::string& jsonPath);
+        void checkWarningMode();
+
+        // InfluxDB
+        std::string influxdbUrl_;
+        std::string influxdbToken_;
+        std::string influxdbOrg_;
+        std::string influxdbBucket_;
+        std::map<std::string, int> influxHitAccum_;
+        int influxTrackAccum_ = 0;
+        int influxEventAccum_ = 0;
+        std::chrono::steady_clock::time_point runStartTime_;
+        void sendInfluxDB();
     };
 } // namespace corryvreckan
 #endif // OnlineMonitor_H

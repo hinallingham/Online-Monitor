@@ -37,8 +37,11 @@ Canvases refresh automatically every `update` events **or** every 5 seconds — 
 
 | Feature | Description |
 |---|---|
-| 📊 **Multi-canvas display** | 10+ configurable canvases covering hitmaps, tracking, correlations, charge, and timing |
+| 📊 **Multi-canvas display** | 13 canvases covering hitmaps, tracking, correlations, charge, timing, L1idC, and alignment drift |
 | 📈 **Timeline canvas** | Rolling TProfile: clusters/event per detector (top) + tracks/event (bottom) |
+| 📉 **Corr Trends canvas** | Per-event ΔX / ΔY global [mm] vs event number — early warning for alignment drift |
+| 🔢 **L1idC canvas** | l1idC vs event, wall-clock time vs event, inter-plane sync delta, coincidence rate — DAQ health at a glance |
+| 🔭 **Telescope canvas** | Live 3D track intercepts and cluster hits in Z-X / Z-Y projections |
 | 📡 **Discord alerts** | Webhook notifications for low trigger rate and per-plane hit rate anomalies, with canvas screenshot attached |
 | 🔔 **Auto-recovery notify** | Automatic Discord recovery message when conditions return to normal |
 | 📏 **Progress bar** | Color-coded event counter (blue → orange → green) toward a configurable target |
@@ -51,18 +54,21 @@ Canvases refresh automatically every `update` events **or** every 5 seconds — 
 
 ### 🖼️ Canvases
 
-| Canvas | Default content |
-|---|---|
-| **Overview** | Reference: cluster charge, hitmap, residual X |
-| **Tracking Performance** | χ², angle X/Y, χ²/ndf, tracks/event, clusters/track |
-| **Residuals** | Local residual X per detector |
-| **Timeline** | Clusters/event per detector + tracks/event (rolling) |
-| **Hitmaps** | 2D hitmap per detector |
-| **Event Times** | Event time distribution per detector |
-| **Charge Distributions** | Cluster charge per detector |
-| **Correlation 1D X/Y** | 1D X and Y correlations per detector |
-| **Correlation 2D X/Y** | 2D local X and Y correlations per detector |
-| **DUTs** | Per-DUT canvas — fully user-configurable |
+| Canvas | Group | Default content |
+|---|---|---|
+| **Overview** | Tracking | Reference: cluster charge, hitmap, residual X |
+| **Tracking Performance** | Tracking | χ², angle X/Y, χ²/ndf, tracks/event, clusters/track |
+| **Residuals** | Tracking | Local residual X per detector |
+| **Timeline** | Tracking | Clusters/event per detector (top) + tracks/event (bottom), rolling TProfile |
+| **Telescope** | Tracking | Live track intercepts and cluster hit positions in Z-X / Z-Y projections |
+| **Corr Trends** | Tracking | ΔX / ΔY global [mm] vs event number per non-reference detector — alignment drift monitor |
+| **Hitmaps** | Detectors | 2D hitmap per detector |
+| **Event Times** | Detectors | Event time distribution per detector (`Correlations` module output) |
+| **Charge Distributions** | Detectors | Cluster charge per detector |
+| **L1idC** | Detectors | l1idC vs event, wall-clock timer vs event, inter-plane l1idC delta, coincidence rate |
+| **Correlation 1D X/Y** | Correlations 1D | 1D X and Y correlations per detector |
+| **Correlation 2D X/Y** | Correlations 2D | 2D local X and Y correlations per detector |
+| **DUTs** | DUTs | Per-DUT canvas — fully user-configurable |
 
 Plot paths support three substitution keywords:
 - `%DETECTOR%` — expanded for every non-auxiliary, non-passive detector
@@ -201,8 +207,11 @@ LinuxはファイルへのConcurrent読み取りアクセスを許可してい�
 
 | 機能 | 説明 |
 |---|---|
-| 📊 **マルチキャンバス表示** | ヒットマップ・トラッキング・相関・電荷・タイミングをカバーする10以上のキャンバス |
+| 📊 **マルチキャンバス表示** | ヒットマップ・トラッキング・相関・電荷・タイミング・L1idC・アライメントドリフトをカバーする 13 キャンバス |
 | 📈 **タイムラインキャンバス** | ローリングTProfile：上段に検出器ごとのclusters/event、下段にtracks/event |
+| 📉 **Corr Trends キャンバス** | イベント番号に対する ΔX / ΔY グローバル [mm] — アライメントドリフトの早期検出 |
+| 🔢 **L1idC キャンバス** | l1idC vs イベント・実時間 vs イベント・プレーン間 l1idC ズレ・coincidence rate — DAQ 品質を一画面で確認 |
+| 🔭 **Telescope キャンバス** | ライブトラック交点とクラスターヒットを Z-X / Z-Y 投影で表示 |
 | 📡 **Discord通知** | トリガーレート低下・プレーン異常ヒットレートをキャンバスのスクリーンショット付きで通知 |
 | 🔔 **自動復帰通知** | 状態が正常に戻った際に自動でDiscord復帰メッセージを送信 |
 | 📏 **プログレスバー** | 目標イベント数に向けた色付きカウンター（青→橙→緑） |
@@ -215,18 +224,21 @@ LinuxはファイルへのConcurrent読み取りアクセスを許可してい�
 
 ### 🖼️ キャンバス一覧
 
-| キャンバス | デフォルト表示内容 |
-|---|---|
-| **Overview** | リファレンス：クラスター電荷、ヒットマップ、残差X |
-| **Tracking Performance** | χ²、角度X/Y、χ²/ndf、tracks/event、clusters/track |
-| **Residuals** | 検出器ごとのローカル残差X |
-| **Timeline** | 検出器ごとのclusters/event + tracks/event（ローリング） |
-| **Hitmaps** | 検出器ごとの2Dヒットマップ |
-| **Event Times** | 検出器ごとのイベント時刻分布 |
-| **Charge Distributions** | 検出器ごとのクラスター電荷 |
-| **Correlation 1D X/Y** | 検出器ごとの1D相関（X・Y） |
-| **Correlation 2D X/Y** | 検出器ごとの2Dローカル相関（X・Y） |
-| **DUTs** | DUTごとのキャンバス（完全にユーザー設定可能） |
+| キャンバス | グループ | デフォルト表示内容 |
+|---|---|---|
+| **Overview** | Tracking | リファレンス：クラスター電荷、ヒットマップ、残差X |
+| **Tracking Performance** | Tracking | χ²、角度X/Y、χ²/ndf、tracks/event、clusters/track |
+| **Residuals** | Tracking | 検出器ごとのローカル残差X |
+| **Timeline** | Tracking | 検出器ごとのclusters/event（上段）+ tracks/event（下段）ローリング |
+| **Telescope** | Tracking | ライブトラック交点・クラスターヒット位置をZ-X / Z-Y投影で表示 |
+| **Corr Trends** | Tracking | 非リファレンス検出器ごとの ΔX / ΔY グローバル [mm] vs イベント番号 — アライメントドリフト検出 |
+| **Hitmaps** | Detectors | 検出器ごとの2Dヒットマップ |
+| **Event Times** | Detectors | 検出器ごとのイベント時刻分布（`Correlations` モジュール出力） |
+| **Charge Distributions** | Detectors | 検出器ごとのクラスター電荷 |
+| **L1idC** | Detectors | l1idC vs イベント、実時間 vs イベント、プレーン間 l1idC ズレ、coincidence rate — DAQ 品質一覧 |
+| **Correlation 1D X/Y** | Correlations 1D | 検出器ごとの1D相関（X・Y） |
+| **Correlation 2D X/Y** | Correlations 2D | 検出器ごとの2Dローカル相関（X・Y） |
+| **DUTs** | DUTs | DUTごとのキャンバス（完全にユーザー設定可能） |
 
 プロットパスには以下の置換キーワードが使用できます：
 - `%DETECTOR%` — Auxiliary・Passive以外の全検出器に展開

@@ -10,13 +10,16 @@
  */
 
 #include "OnlineMonitor.h"
+#include <KeySymbols.h>
 #include <TColor.h>
 #include <TGButtonGroup.h>
 #include <TStyle.h>
 #include <TVirtualPadEditor.h>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <regex>
+#include <vector>
 
 using namespace corryvreckan;
 using namespace std;
@@ -30,6 +33,11 @@ OnlineMonitor::OnlineMonitor(Configuration& config, std::vector<std::shared_ptr<
     config_.setDefault<std::string>("clustering_module", "Clustering4D");
     config_.setDefault<std::string>("tracking_module", "Tracking4D");
 
+    config_.setDefault<std::string>("influxdb_url", "");
+    config_.setDefault<std::string>("influxdb_token", "");
+    config_.setDefault<std::string>("influxdb_org", "malta");
+    config_.setDefault<std::string>("influxdb_bucket", "corry");
+
     config_.setDefault<std::string>("discord_webhook", "");
     config_.setDefault<double>("discord_min_rate", 100.0);
     config_.setDefault<int>("discord_alert_duration", 30);
@@ -38,12 +46,21 @@ OnlineMonitor::OnlineMonitor(Configuration& config, std::vector<std::shared_ptr<
     config_.setDefault<int>("target_events", 0);
     config_.setDefault<int>("auto_save_interval", 0);
     config_.setDefault<std::string>("auto_save_dir", "./");
+    config_.setDefault<int>("telescope_reset_tracks", 0);
+    config_.setDefault<double>("warning_min_clusters_per_event", 0.0);
+    config_.setDefault<double>("warning_min_tracks_per_event", 0.0);
+    config_.setDefault<int>("warning_duration", 10);
 
     canvasTitle = config_.get<std::string>("canvas_title");
     updateNumber = config_.get<int>("update");
     ignoreAux = config_.get<bool>("ignore_aux");
     clusteringModule = config_.get<std::string>("clustering_module");
     trackingModule = config_.get<std::string>("tracking_module");
+
+    influxdbUrl_    = config_.get<std::string>("influxdb_url");
+    influxdbToken_  = config_.get<std::string>("influxdb_token");
+    influxdbOrg_    = config_.get<std::string>("influxdb_org");
+    influxdbBucket_ = config_.get<std::string>("influxdb_bucket");
 
     discordWebhook_ = config_.get<std::string>("discord_webhook");
     discordMinRate_ = config_.get<double>("discord_min_rate");
@@ -53,6 +70,10 @@ OnlineMonitor::OnlineMonitor(Configuration& config, std::vector<std::shared_ptr<
     targetEvents_ = config_.get<int>("target_events");
     autoSaveInterval_ = config_.get<int>("auto_save_interval");
     autoSaveDir_ = config_.get<std::string>("auto_save_dir");
+    telescopeResetTracks_ = config_.get<int>("telescope_reset_tracks");
+    warningMinClustersPerEvent_ = config_.get<double>("warning_min_clusters_per_event");
+    warningMinTracksPerEvent_ = config_.get<double>("warning_min_tracks_per_event");
+    warningDuration_ = config_.get<int>("warning_duration");
 
     config_.setDefaultMatrix<std::string>("overview",
                                           {{trackingModule + "/trackChi2ndof"},
@@ -103,11 +124,12 @@ OnlineMonitor::OnlineMonitor(Configuration& config, std::vector<std::shared_ptr<
 }
 
 void OnlineMonitor::initialize() {
+    runStartTime_ = std::chrono::steady_clock::now();
     gui_run();
 
     // Timeline: 200 bins, each bin = one update interval
-    const int nBins = 200;
-    const double xMax = static_cast<double>(nBins * updateNumber);
+    timelineNBins_ = 200;
+    const double xMax = static_cast<double>(timelineNBins_ * updateNumber);
 
     static const Color_t kDetColors[] = {
         kRed + 1, kBlue + 1, kGreen + 2, kOrange + 7, kMagenta + 1, kCyan + 2, kViolet + 1, kTeal + 1};
@@ -119,7 +141,8 @@ void OnlineMonitor::initialize() {
 
         auto* prof = new TProfile(("hits_tl_" + det->getName()).c_str(),
                                   ";Event;Clusters / Event",
-                                  nBins, 0.0, xMax);
+                                  timelineNBins_, 0.0, xMax);
+        prof->SetCanExtend(TH1::kAllAxes);
         GuiDisplay::TimelineData td;
         td.detectorName = det->getName();
         td.profile = prof;
@@ -127,8 +150,68 @@ void OnlineMonitor::initialize() {
         gui->timelineHitData_.push_back(td);
     }
 
-    profile_tracks_ = new TProfile("tracks_tl", ";Event;Tracks / Event", nBins, 0.0, xMax);
+    profile_tracks_ = new TProfile("tracks_tl", ";Event;Tracks / Event", timelineNBins_, 0.0, xMax);
+    profile_tracks_->SetCanExtend(TH1::kAllAxes);
     gui->timelineTrackProfile_ = profile_tracks_;
+
+    // Correlation trend profiles: mean(global_pos_i - global_pos_ref) vs event number
+    static const Color_t kCorrColors[] = {kRed+1, kBlue+1, kGreen+2, kOrange+7, kMagenta+1, kCyan+2};
+    int cIdx = 0;
+    auto refDet = get_reference();
+    if(refDet) {
+        for(auto& det : get_detectors()) {
+            if(ignoreAux && det->isAuxiliary()) continue;
+            if(det->hasRole(DetectorRole::PASSIVE)) continue;
+            if(det->getName() == refDet->getName()) continue;
+
+            GuiDisplay::CorrelationTrendData cd;
+            cd.detectorName = det->getName();
+            cd.color = kCorrColors[cIdx++ % 6];
+
+            std::string titleX = ";Event;#Delta X_{global} [mm] (" + det->getName() + " - " + refDet->getName() + ")";
+            cd.profileX = new TProfile(("corr_x_tl_" + det->getName()).c_str(),
+                                       titleX.c_str(), timelineNBins_, 0.0, xMax);
+            cd.profileX->SetCanExtend(TH1::kAllAxes);
+
+            std::string titleY = ";Event;#Delta Y_{global} [mm] (" + det->getName() + " - " + refDet->getName() + ")";
+            cd.profileY = new TProfile(("corr_y_tl_" + det->getName()).c_str(),
+                                       titleY.c_str(), timelineNBins_, 0.0, xMax);
+            cd.profileY->SetCanExtend(TH1::kAllAxes);
+
+            gui->correlationTrendData_.push_back(cd);
+        }
+    }
+
+    // Telescope view: collect detector z positions and spatial extent
+    {
+        double zMin = std::numeric_limits<double>::max();
+        double zMax = std::numeric_limits<double>::lowest();
+        double xHalf = 0.0, yHalf = 0.0;
+        for(auto& det : get_detectors()) {
+            if(ignoreAux && det->isAuxiliary()) continue;
+            if(det->hasRole(DetectorRole::PASSIVE)) continue;
+            double z = det->displacement().z();
+            telescopeDetZ_.push_back(z);
+            zMin = std::min(zMin, z);
+            zMax = std::max(zMax, z);
+            auto sz = det->getSize();
+            xHalf = std::max(xHalf, std::abs(det->displacement().x()) + sz.x() * 0.6);
+            yHalf = std::max(yHalf, std::abs(det->displacement().y()) + sz.y() * 0.6);
+        }
+        if(!telescopeDetZ_.empty()) {
+            double zMargin = std::max(1.0, (zMax - zMin) * 0.05);
+            xHalf = std::max(xHalf, 5.0);
+            yHalf = std::max(yHalf, 5.0);
+            telescopeHitXZ_ = new TH2F("tel_xz", ";z [mm];x [mm]",
+                                       300, zMin - zMargin, zMax + zMargin,
+                                       200, -xHalf, xHalf);
+            telescopeHitYZ_ = new TH2F("tel_yz", ";z [mm];y [mm]",
+                                       300, zMin - zMargin, zMax + zMargin,
+                                       200, -yHalf, yHalf);
+            gui->telescopeHitXZ = telescopeHitXZ_;
+            gui->telescopeHitYZ = telescopeHitYZ_;
+        }
+    }
 
     gui->saveDir_ = autoSaveDir_;
     lastAutoSaveTime_ = std::chrono::steady_clock::now();
@@ -136,6 +219,7 @@ void OnlineMonitor::initialize() {
 
 StatusCode OnlineMonitor::run(const std::shared_ptr<Clipboard>& clipboard) {
     fillTimeline(clipboard);
+    fillCorrelation(clipboard);
     gui_update();
     eventNumber++;
     return StatusCode::Success;
@@ -276,7 +360,11 @@ void OnlineMonitor::AddHisto(string canvasName, string histoName, string style, 
 
     TH1* histogram = static_cast<TH1*>(gDirectory->Get(histoName.c_str()));
     if(histogram) {
-        gui->histograms[canvasName].push_back(static_cast<TH1*>(gDirectory->Get(histoName.c_str())));
+        // Allow 1D histograms to extend their x-axis when data exceeds the initial range
+        if(!dynamic_cast<TH2*>(histogram)) {
+            histogram->SetCanExtend(TH1::kAllAxes);
+        }
+        gui->histograms[canvasName].push_back(histogram);
         gui->logarithmic[gui->histograms[canvasName].back()] = logy;
         gui->styles[gui->histograms[canvasName].back()] = style;
     } else {
@@ -331,6 +419,18 @@ void OnlineMonitor::gui_run() {
     gui->buttons["Timeline"]->Connect("Pressed()", "corryvreckan::GuiDisplay", gui, "DisplayTimeline()");
     gui->canvasOrder_.push_back("TimelineCanvas");
 
+    gui->buttons["Telescope"] = new TGTextButton(gui->buttonGroups["Tracking"], "Telescope");
+    gui->buttonGroups["Tracking"]->AddFrame(gui->buttons["Telescope"],
+                                            new TGLayoutHints(kLHintsTop | kLHintsExpandX, 0, 0, 0, 0));
+    gui->buttons["Telescope"]->Connect("Pressed()", "corryvreckan::GuiDisplay", gui, "DisplayTelescope()");
+    gui->canvasOrder_.push_back("TelescopeCanvas");
+
+    gui->buttons["CorrTrends"] = new TGTextButton(gui->buttonGroups["Tracking"], "Corr Trends");
+    gui->buttonGroups["Tracking"]->AddFrame(gui->buttons["CorrTrends"],
+                                            new TGLayoutHints(kLHintsTop | kLHintsExpandX, 0, 0, 0, 0));
+    gui->buttons["CorrTrends"]->Connect("Pressed()", "corryvreckan::GuiDisplay", gui, "DisplayCorrelation()");
+    gui->canvasOrder_.push_back("CorrelationCanvas");
+
     AddCanvasGroup("Detectors");
     AddCanvas("Hitmaps", "Detectors", canvas_hitmaps);
     gui->canvasOrder_.push_back("HitmapsCanvas");
@@ -338,6 +438,18 @@ void OnlineMonitor::gui_run() {
     gui->canvasOrder_.push_back("Event TimesCanvas");
     AddCanvas("Charge Distributions", "Detectors", canvas_charge);
     gui->canvasOrder_.push_back("Charge DistributionsCanvas");
+
+    // L1idC / event-time monitoring canvas
+    {
+        Matrix<std::string> canvas_l1idc = {
+            {"EventLoaderMALTA/hL1idCVsEvent"},
+            {"EventLoaderMALTA/hTimerVsEvent"},
+            {"EventLoaderMALTA/hL1idCPlaneDelta"},
+            {"EventLoaderMALTA/hCoincidenceRateTrend"}
+        };
+        AddCanvas("L1idC", "Detectors", canvas_l1idc);
+        gui->canvasOrder_.push_back("L1idCCanvas");
+    }
 
     AddCanvasGroup("Correlations 1D");
     AddCanvas("1D X", "Correlations 1D", canvas_cx);
@@ -423,6 +535,7 @@ void OnlineMonitor::gui_run() {
         bindKey(static_cast<EKeySym>(kKey_0 + i), "canvas" + std::to_string(i - 1));
     }
 
+    gui->windowTitle_ = canvasTitle;
     gui->SetWindowName(canvasTitle.c_str());
     gui->MapSubwindows();
     gui->Resize(gui->GetDefaultSize());
@@ -446,6 +559,69 @@ void OnlineMonitor::gui_run() {
     eventRate_ = 0.0;
 }
 
+void OnlineMonitor::checkWarningMode() {
+    if(warningMinClustersPerEvent_ <= 0.0 && warningMinTracksPerEvent_ <= 0.0) return;
+
+    auto now = std::chrono::steady_clock::now();
+
+    // Compute average clusters/event across all planes
+    double avgClusters = 0.0;
+    int nPlanes = 0;
+    for(auto& [name, accum] : warnClusterAccum_) {
+        if(warnEventAccum_ > 0) {
+            avgClusters += static_cast<double>(accum) / warnEventAccum_;
+            nPlanes++;
+        }
+        warnClusterAccum_[name] = 0;
+    }
+    if(nPlanes > 0) avgClusters /= nPlanes;
+
+    // Compute tracks/event
+    double tracksPerEvent = 0.0;
+    if(warnEventAccum_ > 0) {
+        tracksPerEvent = static_cast<double>(warnTrackAccum_) / warnEventAccum_;
+    }
+    warnTrackAccum_ = 0;
+    warnEventAccum_ = 0;
+
+    // Check if any enabled threshold is breached (skip very early startup)
+    bool clustersBreach = (warningMinClustersPerEvent_ > 0.0) && (nPlanes > 0) &&
+                          (avgClusters < warningMinClustersPerEvent_) && (eventNumber > updateNumber * 2);
+    bool tracksBreach = (warningMinTracksPerEvent_ > 0.0) &&
+                        (tracksPerEvent < warningMinTracksPerEvent_) && (eventNumber > updateNumber * 2);
+    bool belowThreshold = clustersBreach || tracksBreach;
+
+    if(belowThreshold) {
+        if(!warningInitiated_) {
+            warningInitiated_ = true;
+            warningBelowSince_ = now;
+            LOG(WARNING) << "Low rate detected:"
+                         << " clusters/evt=" << std::fixed << std::setprecision(2) << avgClusters
+                         << " tracks/evt=" << tracksPerEvent;
+        } else if(!warningModeActive_) {
+            double elapsed = std::chrono::duration<double>(now - warningBelowSince_).count();
+            if(elapsed >= static_cast<double>(warningDuration_)) {
+                warningModeActive_ = true;
+                gui->warningActive = true;
+                LOG(WARNING) << "Warning mode ON:"
+                             << " clusters/evt=" << std::fixed << std::setprecision(2) << avgClusters
+                             << " (min=" << warningMinClustersPerEvent_ << ")"
+                             << " tracks/evt=" << tracksPerEvent
+                             << " (min=" << warningMinTracksPerEvent_ << ")";
+            }
+        }
+    } else {
+        if(warningModeActive_) {
+            warningModeActive_ = false;
+            gui->warningActive = false;
+            LOG(INFO) << "Warning mode OFF:"
+                      << " clusters/evt=" << std::fixed << std::setprecision(2) << avgClusters
+                      << " tracks/evt=" << tracksPerEvent;
+        }
+        warningInitiated_ = false;
+    }
+}
+
 void OnlineMonitor::sendDiscordPayload(const std::string& jsonPath) {
     static const std::string snapPath = "/tmp/corry_snap.png";
     gui->canvas->GetCanvas()->Print(snapPath.c_str());
@@ -455,6 +631,110 @@ void OnlineMonitor::sendDiscordPayload(const std::string& jsonPath) {
                       " \"" + discordWebhook_ + "\" > /dev/null 2>&1 &";
     if(system(cmd.c_str()) != 0) {
         LOG(WARNING) << "Discord command returned non-zero";
+    }
+}
+
+void OnlineMonitor::sendInfluxDB() {
+    if(influxdbUrl_.empty()) return;
+
+    auto now_sys    = std::chrono::system_clock::now();
+    auto now_steady = std::chrono::steady_clock::now();
+    long long ts    = std::chrono::duration_cast<std::chrono::nanoseconds>(now_sys.time_since_epoch()).count();
+    double elapsed  = std::chrono::duration<double>(now_steady - runStartTime_).count();
+
+    int ev = (influxEventAccum_ > 0) ? influxEventAccum_ : 1;
+    double tracksPerEvent = static_cast<double>(influxTrackAccum_) / ev;
+
+    std::string lines;
+
+    // イベントレート系
+    lines += "corry_rate event_rate=" + std::to_string(eventRate_) +
+             ",tracks_per_event=" + std::to_string(tracksPerEvent) +
+             ",event_number=" + std::to_string(eventNumber) +
+             " " + std::to_string(ts) + "\n";
+
+    // ランステータス・警告状態
+    lines += "corry_status elapsed_seconds=" + std::to_string(elapsed) +
+             ",warning_active=" + std::to_string(warningModeActive_ ? 1 : 0) +
+             " " + std::to_string(ts) + "\n";
+
+    // 検出器ごとのクラスター数
+    for(auto& [detName, hits] : influxHitAccum_) {
+        double cpe = static_cast<double>(hits) / ev;
+        std::string tag = detName;
+        for(char& c : tag) if(c == ' ') c = '_';
+        lines += "corry_detector,detector=" + tag +
+                 " clusters_per_event=" + std::to_string(cpe) +
+                 " " + std::to_string(ts) + "\n";
+        hits = 0;
+    }
+    influxTrackAccum_ = 0;
+    influxEventAccum_ = 0;
+
+    // ROOTヒストグラムから統計値を取得するヘルパー
+    auto readHist = [](const std::string& path, double& mean, double& rms) -> bool {
+        auto* h = static_cast<TH1*>(gDirectory->Get(("/" + path).c_str()));
+        if(!h || h->GetEntries() == 0) return false;
+        mean = h->GetMean();
+        rms  = h->GetRMS();
+        return true;
+    };
+
+    // Track χ²/ndof
+    {
+        double mean, rms;
+        if(readHist(trackingModule + "/trackChi2ndof", mean, rms)) {
+            lines += "corry_tracking chi2ndof_mean=" + std::to_string(mean) +
+                     " " + std::to_string(ts) + "\n";
+        }
+    }
+
+    // 検出器ごと: Residual X/Y RMS、クラスターサイズ
+    for(auto& det : get_detectors()) {
+        if(ignoreAux && det->isAuxiliary()) continue;
+        if(det->hasRole(DetectorRole::PASSIVE)) continue;
+        const std::string& name = det->getName();
+        std::string tag = name;
+        for(char& c : tag) if(c == ' ') c = '_';
+
+        double mean, rms;
+        if(readHist(trackingModule + "/" + name + "/local_residuals/LocalResidualsX", mean, rms)) {
+            lines += "corry_residual,detector=" + tag + ",axis=X" +
+                     " mean=" + std::to_string(mean) + ",rms=" + std::to_string(rms) +
+                     " " + std::to_string(ts) + "\n";
+        }
+        if(readHist(trackingModule + "/" + name + "/local_residuals/LocalResidualsY", mean, rms)) {
+            lines += "corry_residual,detector=" + tag + ",axis=Y" +
+                     " mean=" + std::to_string(mean) + ",rms=" + std::to_string(rms) +
+                     " " + std::to_string(ts) + "\n";
+        }
+        if(readHist(clusteringModule + "/" + name + "/clusterSize", mean, rms)) {
+            lines += "corry_cluster,detector=" + tag +
+                     " mean_size=" + std::to_string(mean) +
+                     " " + std::to_string(ts) + "\n";
+        }
+    }
+
+    // スナップショット保存（最新画像の上書き）
+    if(!autoSaveDir_.empty()) {
+        gui->SaveCanvas(autoSaveDir_ + "latest.png");
+    }
+
+    // InfluxDBへ送信
+    std::string tmpPath = "/tmp/corry_influx.lp";
+    {
+        std::ofstream f(tmpPath);
+        if(!f) { LOG(WARNING) << "Cannot write InfluxDB payload to " << tmpPath; return; }
+        f << lines;
+    }
+    std::string cmd = "curl -s -X POST"
+        " \"" + influxdbUrl_ + "/api/v2/write?org=" + influxdbOrg_ +
+        "&bucket=" + influxdbBucket_ + "&precision=ns\""
+        " -H \"Authorization: Token " + influxdbToken_ + "\""
+        " -H \"Content-Type: text/plain; charset=utf-8\""
+        " --data-binary @'" + tmpPath + "' > /dev/null 2>&1 &";
+    if(system(cmd.c_str()) != 0) {
+        LOG(WARNING) << "InfluxDB curl command returned non-zero";
     }
 }
 
@@ -630,11 +910,111 @@ void OnlineMonitor::fillTimeline(const std::shared_ptr<Clipboard>& clipboard) {
         td.profile->Fill(ev, n);
         planeHitAccum_[td.detectorName] += static_cast<int>(clusters.size());
         planeEventAccum_[td.detectorName]++;
+        warnClusterAccum_[td.detectorName] += static_cast<int>(clusters.size());
+        influxHitAccum_[td.detectorName] += static_cast<int>(clusters.size());
+
+        // Telescope: fill cluster hit positions in the z-x and z-y projections
+        if(telescopeHitXZ_ && telescopeHitYZ_) {
+            for(auto& cluster : clusters) {
+                const auto& g = cluster->global();
+                telescopeHitXZ_->Fill(g.z(), g.x());
+                telescopeHitYZ_->Fill(g.z(), g.y());
+            }
+        }
     }
+    warnEventAccum_++;
+    influxEventAccum_++;
 
     if(profile_tracks_) {
         auto& tracks = clipboard->getData<Track>();
         profile_tracks_->Fill(ev, static_cast<double>(tracks.size()));
+        warnTrackAccum_ += static_cast<int>(tracks.size());
+        influxTrackAccum_ += static_cast<int>(tracks.size());
+
+        // Telescope: store intercept points of each track at every detector plane
+        if(!telescopeDetZ_.empty()) {
+            static const Color_t kTrackPalette[GuiDisplay::kNTrackColors] = {
+                kRed, kBlue + 1, kGreen + 2, kMagenta, kCyan + 1, kOrange + 7, kViolet + 1, kTeal + 1};
+            for(auto& track : tracks) {
+                telescopeTrackCount_++;
+
+                // Reset hit histograms and track buffer when the threshold is reached
+                if(telescopeResetTracks_ > 0 && telescopeTrackCount_ >= telescopeResetTracks_) {
+                    telescopeTrackCount_ = 0;
+                    if(telescopeHitXZ_) telescopeHitXZ_->Reset();
+                    if(telescopeHitYZ_) telescopeHitYZ_->Reset();
+                    gui->telescopeTracks.clear();
+                }
+
+                GuiDisplay::TrackView tv;
+                tv.color = kTrackPalette[gui->telescopeColorIdx++ % GuiDisplay::kNTrackColors];
+                for(double z : telescopeDetZ_) {
+                    auto pt = track->getIntercept(z);
+                    tv.z.push_back(pt.z());
+                    tv.x.push_back(pt.x());
+                    tv.y.push_back(pt.y());
+                }
+                gui->telescopeTracks.push_back(std::move(tv));
+                while(gui->telescopeTracks.size() > static_cast<size_t>(GuiDisplay::kTelescopeMaxTracks)) {
+                    gui->telescopeTracks.pop_front();
+                }
+            }
+        }
+    }
+
+    // After auto-extension the bin count doubles; rebin down to keep ~timelineNBins_ bins
+    auto rebinIfNeeded = [this](TProfile* p) {
+        if(!p) return;
+        int n = p->GetNbinsX();
+        if(n > timelineNBins_) p->RebinX(n / timelineNBins_);
+    };
+    for(auto& td : gui->timelineHitData_) rebinIfNeeded(td.profile);
+    rebinIfNeeded(profile_tracks_);
+}
+
+void OnlineMonitor::fillCorrelation(const std::shared_ptr<Clipboard>& clipboard) {
+    if(gui->correlationTrendData_.empty()) return;
+
+    auto refDet = get_reference();
+    if(!refDet) return;
+
+    // Mean global X/Y of clusters on the reference plane for this event
+    auto& refClusters = clipboard->getData<Cluster>(refDet->getName());
+    if(refClusters.empty()) return;
+
+    double sumXRef = 0.0, sumYRef = 0.0;
+    for(auto& c : refClusters) {
+        sumXRef += c->global().x();
+        sumYRef += c->global().y();
+    }
+    double meanXRef = sumXRef / static_cast<double>(refClusters.size());
+    double meanYRef = sumYRef / static_cast<double>(refClusters.size());
+
+    double ev = static_cast<double>(eventNumber);
+
+    for(auto& cd : gui->correlationTrendData_) {
+        auto& clusters = clipboard->getData<Cluster>(cd.detectorName);
+        if(clusters.empty()) continue;
+
+        double sumX = 0.0, sumY = 0.0;
+        for(auto& c : clusters) {
+            sumX += c->global().x();
+            sumY += c->global().y();
+        }
+        double n = static_cast<double>(clusters.size());
+        if(cd.profileX) cd.profileX->Fill(ev, sumX / n - meanXRef);
+        if(cd.profileY) cd.profileY->Fill(ev, sumY / n - meanYRef);
+    }
+
+    // Keep bin count bounded (same rebin logic as fillTimeline)
+    auto rebinIfNeeded = [this](TProfile* p) {
+        if(!p) return;
+        int n = p->GetNbinsX();
+        if(n > timelineNBins_) p->RebinX(n / timelineNBins_);
+    };
+    for(auto& cd : gui->correlationTrendData_) {
+        rebinIfNeeded(cd.profileX);
+        rebinIfNeeded(cd.profileY);
     }
 }
 
@@ -654,12 +1034,18 @@ void OnlineMonitor::gui_update() {
         lastUpdateEventNumber_ = eventNumber;
 
         if(eventCycle) {
-            gui->Update();
+            if(gui->currentCanvas_ == "TelescopeCanvas") {
+                gui->DisplayTelescope();
+            } else {
+                gui->Update();
+            }
         }
         gui->updateStatus(eventNumber, eventRate_);
         gui->updateProgress(eventNumber, targetEvents_);
         checkDiscordAlert();
         checkPlaneAlerts();
+        checkWarningMode();
+        sendInfluxDB();
 
         // Auto-save current canvas
         if(autoSaveInterval_ > 0) {
