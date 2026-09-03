@@ -15,7 +15,7 @@
 #include <TGButtonGroup.h>
 #include <TStyle.h>
 #include <TVirtualPadEditor.h>
-#include <fstream>
+#include <algorithm>
 #include <iomanip>
 #include <limits>
 #include <regex>
@@ -32,17 +32,9 @@ OnlineMonitor::OnlineMonitor(Configuration& config, std::vector<std::shared_ptr<
     config_.setDefault<bool>("ignore_aux", true);
     config_.setDefault<std::string>("clustering_module", "Clustering4D");
     config_.setDefault<std::string>("tracking_module", "Tracking4D");
+    config_.setDefault<std::string>("event_counter", "run_count");
+    config_.setDefault<std::string>("event_counter_dut", "");
 
-    config_.setDefault<std::string>("influxdb_url", "");
-    config_.setDefault<std::string>("influxdb_token", "");
-    config_.setDefault<std::string>("influxdb_org", "malta");
-    config_.setDefault<std::string>("influxdb_bucket", "corry");
-
-    config_.setDefault<std::string>("discord_webhook", "");
-    config_.setDefault<double>("discord_min_rate", 100.0);
-    config_.setDefault<int>("discord_alert_duration", 30);
-    config_.setDefault<double>("discord_max_hit_rate", 0.0);
-    config_.setDefault<double>("discord_min_hit_rate", 0.0);
     config_.setDefault<int>("target_events", 0);
     config_.setDefault<int>("auto_save_interval", 0);
     config_.setDefault<std::string>("auto_save_dir", "./");
@@ -57,16 +49,48 @@ OnlineMonitor::OnlineMonitor(Configuration& config, std::vector<std::shared_ptr<
     clusteringModule = config_.get<std::string>("clustering_module");
     trackingModule = config_.get<std::string>("tracking_module");
 
-    influxdbUrl_    = config_.get<std::string>("influxdb_url");
-    influxdbToken_  = config_.get<std::string>("influxdb_token");
-    influxdbOrg_    = config_.get<std::string>("influxdb_org");
-    influxdbBucket_ = config_.get<std::string>("influxdb_bucket");
+    // event_counter selects what eventNumber (displayed Events count, progress bar, Timeline/Corr Trends
+    // X-axis) counts. Rate-style metrics (status bar "Rate: X evt/s", warning mode's clusters/tracks-per-
+    // event) are unaffected -- they always use one-per-run() as their denominator (runCount_), since
+    // "tracks per event" would be meaningless if "event" itself already meant "a track".
+    std::string event_counter_str = config_.get<std::string>("event_counter");
+    if(event_counter_str == "run_count") {
+        eventCounterMode_ = EventCounterMode::RunCount;
+        eventCounterLabel_ = "Event";
+    } else if(event_counter_str == "tracks") {
+        eventCounterMode_ = EventCounterMode::Tracks;
+        eventCounterLabel_ = "Track";
+    } else if(event_counter_str == "dut_associated_tracks") {
+        eventCounterMode_ = EventCounterMode::DutAssociatedTracks;
+        eventCounterLabel_ = "DUT-associated Track";
+    } else {
+        throw InvalidValueError(
+            config_, "event_counter", "Must be one of \"run_count\", \"tracks\", \"dut_associated_tracks\"");
+    }
 
-    discordWebhook_ = config_.get<std::string>("discord_webhook");
-    discordMinRate_ = config_.get<double>("discord_min_rate");
-    discordAlertDuration_ = config_.get<int>("discord_alert_duration");
-    discordMaxHitRate_ = config_.get<double>("discord_max_hit_rate");
-    discordMinHitRate_ = config_.get<double>("discord_min_hit_rate");
+    if(eventCounterMode_ == EventCounterMode::DutAssociatedTracks) {
+        auto duts = get_duts();
+        if(duts.empty()) {
+            throw InvalidValueError(
+                config_, "event_counter", "event_counter=\"dut_associated_tracks\" requires at least one DUT in the geometry");
+        }
+        eventCounterDut_ = config_.get<std::string>("event_counter_dut");
+        if(eventCounterDut_.empty()) {
+            if(duts.size() > 1) {
+                throw InvalidValueError(config_,
+                                        "event_counter_dut",
+                                        "Multiple DUTs in geometry -- event_counter_dut must specify which one to "
+                                        "count associated tracks for");
+            }
+            eventCounterDut_ = duts.front()->getName();
+        } else if(std::none_of(duts.begin(), duts.end(), [&](auto& d) { return d->getName() == eventCounterDut_; })) {
+            throw InvalidValueError(config_, "event_counter_dut", "\"" + eventCounterDut_ + "\" is not a DUT in the geometry");
+        }
+        LOG(STATUS) << "Event counter: DUT-associated tracks on \"" << eventCounterDut_ << "\"";
+    } else if(eventCounterMode_ == EventCounterMode::Tracks) {
+        LOG(STATUS) << "Event counter: tracks";
+    }
+
     targetEvents_ = config_.get<int>("target_events");
     autoSaveInterval_ = config_.get<int>("auto_save_interval");
     autoSaveDir_ = config_.get<std::string>("auto_save_dir");
@@ -124,7 +148,34 @@ OnlineMonitor::OnlineMonitor(Configuration& config, std::vector<std::shared_ptr<
 }
 
 void OnlineMonitor::initialize() {
-    runStartTime_ = std::chrono::steady_clock::now();
+    // Residual-vs-event trend TProfiles must be booked *before* gui_run() below: gui_run() builds
+    // the Residuals canvas immediately, and AddHisto() only finds histograms that already exist
+    // in gDirectory at that point (see residualTrendData_'s doc comment in the header).
+    {
+        static constexpr int kResidualTrendNBins = 200;
+        const double residualXMax = static_cast<double>(kResidualTrendNBins * updateNumber);
+        for(auto& det : get_detectors()) {
+            if(ignoreAux && det->isAuxiliary()) continue;
+            if(det->hasRole(DetectorRole::PASSIVE)) continue;
+
+            ResidualTrendData rd;
+            rd.detectorName = det->getName();
+            rd.isDut = det->isDUT();
+
+            std::string titleX = det->getName() + " Residual X vs Event;Event;Local Residual X [mm]";
+            rd.profileX = new TProfile(("residual_trend_x_" + det->getName()).c_str(),
+                                       titleX.c_str(), kResidualTrendNBins, 0.0, residualXMax);
+            rd.profileX->SetCanExtend(TH1::kAllAxes);
+
+            std::string titleY = det->getName() + " Residual Y vs Event;Event;Local Residual Y [mm]";
+            rd.profileY = new TProfile(("residual_trend_y_" + det->getName()).c_str(),
+                                       titleY.c_str(), kResidualTrendNBins, 0.0, residualXMax);
+            rd.profileY->SetCanExtend(TH1::kAllAxes);
+
+            residualTrendData_.push_back(rd);
+        }
+    }
+
     gui_run();
 
     // Timeline: 200 bins, each bin = one update interval
@@ -139,8 +190,11 @@ void OnlineMonitor::initialize() {
         if(ignoreAux && det->isAuxiliary()) continue;
         if(det->hasRole(DetectorRole::PASSIVE)) continue;
 
+        // X-axis is eventCounterLabel_ (what eventNumber counts); "Clusters / Event" on the Y-axis
+        // deliberately keeps "Event" meaning "one run() call" -- that is what is actually being
+        // averaged per bin, independent of what eventNumber's own units are (see run()/EventCounterMode).
         auto* prof = new TProfile(("hits_tl_" + det->getName()).c_str(),
-                                  ";Event;Clusters / Event",
+                                  (";" + eventCounterLabel_ + ";Clusters / Event").c_str(),
                                   timelineNBins_, 0.0, xMax);
         prof->SetCanExtend(TH1::kAllAxes);
         GuiDisplay::TimelineData td;
@@ -150,7 +204,8 @@ void OnlineMonitor::initialize() {
         gui->timelineHitData_.push_back(td);
     }
 
-    profile_tracks_ = new TProfile("tracks_tl", ";Event;Tracks / Event", timelineNBins_, 0.0, xMax);
+    profile_tracks_ = new TProfile(
+        "tracks_tl", (";" + eventCounterLabel_ + ";Tracks / Event").c_str(), timelineNBins_, 0.0, xMax);
     profile_tracks_->SetCanExtend(TH1::kAllAxes);
     gui->timelineTrackProfile_ = profile_tracks_;
 
@@ -168,12 +223,14 @@ void OnlineMonitor::initialize() {
             cd.detectorName = det->getName();
             cd.color = kCorrColors[cIdx++ % 6];
 
-            std::string titleX = ";Event;#Delta X_{global} [mm] (" + det->getName() + " - " + refDet->getName() + ")";
+            std::string titleX =
+                ";" + eventCounterLabel_ + ";#Delta X_{global} [mm] (" + det->getName() + " - " + refDet->getName() + ")";
             cd.profileX = new TProfile(("corr_x_tl_" + det->getName()).c_str(),
                                        titleX.c_str(), timelineNBins_, 0.0, xMax);
             cd.profileX->SetCanExtend(TH1::kAllAxes);
 
-            std::string titleY = ";Event;#Delta Y_{global} [mm] (" + det->getName() + " - " + refDet->getName() + ")";
+            std::string titleY =
+                ";" + eventCounterLabel_ + ";#Delta Y_{global} [mm] (" + det->getName() + " - " + refDet->getName() + ")";
             cd.profileY = new TProfile(("corr_y_tl_" + det->getName()).c_str(),
                                        titleY.c_str(), timelineNBins_, 0.0, xMax);
             cd.profileY->SetCanExtend(TH1::kAllAxes);
@@ -220,9 +277,36 @@ void OnlineMonitor::initialize() {
 StatusCode OnlineMonitor::run(const std::shared_ptr<Clipboard>& clipboard) {
     fillTimeline(clipboard);
     fillCorrelation(clipboard);
+    fillResidualTrend(clipboard);
+
+    // runCount_ (one per run() call) stays the denominator for all rate-style metrics computed in
+    // gui_update() below; eventNumber (displayed Events count) advances by whatever event_counter_
+    // selects, and can therefore jump by more than one -- or not at all -- per call.
+    runCount_++;
+    eventNumber += computeEventIncrement(clipboard);
+
     gui_update();
-    eventNumber++;
     return StatusCode::Success;
+}
+
+int OnlineMonitor::computeEventIncrement(const std::shared_ptr<Clipboard>& clipboard) {
+    switch(eventCounterMode_) {
+    case EventCounterMode::RunCount:
+        return 1;
+    case EventCounterMode::Tracks:
+        return static_cast<int>(clipboard->getData<Track>().size());
+    case EventCounterMode::DutAssociatedTracks: {
+        int n = 0;
+        for(auto& track : clipboard->getData<Track>()) {
+            if(!track->getAssociatedClusters(eventCounterDut_).empty()) {
+                n++;
+            }
+        }
+        return n;
+    }
+    default:
+        return 1; // unreachable -- all EventCounterMode values are handled above
+    }
 }
 
 void OnlineMonitor::AddCanvasGroup(std::string group_title) {
@@ -413,6 +497,14 @@ void OnlineMonitor::gui_run() {
     AddCanvas("Residuals", "Tracking", canvas_residuals, true);
     gui->canvasOrder_.push_back("ResidualsCanvas");
 
+    // Residual-vs-event trend: OnlineMonitor's own live TProfiles (residualTrendData_, filled in
+    // fillResidualTrend()). Added individually rather than through canvas_residuals/%DETECTOR%,
+    // since that matrix is tied to this canvas's ignoreDut=true above and DUTs should appear here.
+    for(auto& rd : residualTrendData_) {
+        AddHisto("ResidualsCanvas", "OnlineMonitor/residual_trend_x_" + rd.detectorName);
+        AddHisto("ResidualsCanvas", "OnlineMonitor/residual_trend_y_" + rd.detectorName);
+    }
+
     gui->buttons["Timeline"] = new TGTextButton(gui->buttonGroups["Tracking"], "Timeline");
     gui->buttonGroups["Tracking"]->AddFrame(gui->buttons["Timeline"],
                                             new TGLayoutHints(kLHintsTop | kLHintsExpandX, 0, 0, 0, 0));
@@ -445,7 +537,8 @@ void OnlineMonitor::gui_run() {
             {"EventLoaderMALTA/hL1idCVsEvent"},
             {"EventLoaderMALTA/hTimerVsEvent"},
             {"EventLoaderMALTA/hL1idCPlaneDelta"},
-            {"EventLoaderMALTA/hCoincidenceRateTrend"}
+            {"EventLoaderMALTA/hCoincidenceRateTrend"},
+            {"EventLoaderMALTA/hL1idAcceptanceRateTrend"}
         };
         AddCanvas("L1idC", "Detectors", canvas_l1idc);
         gui->canvasOrder_.push_back("L1idCCanvas");
@@ -554,8 +647,10 @@ void OnlineMonitor::gui_run() {
 
     // Initialise member variables
     eventNumber = 0;
+    runCount_ = 0;
     lastUpdateTime_ = std::chrono::steady_clock::now();
     lastUpdateEventNumber_ = 0;
+    lastUpdateRunCount_ = 0;
     eventRate_ = 0.0;
 }
 
@@ -584,11 +679,14 @@ void OnlineMonitor::checkWarningMode() {
     warnTrackAccum_ = 0;
     warnEventAccum_ = 0;
 
-    // Check if any enabled threshold is breached (skip very early startup)
+    // Check if any enabled threshold is breached (skip very early startup). Uses runCount_, not
+    // eventNumber: this is a "have we processed enough real readouts yet" guard, which stays a
+    // run()-count concept regardless of eventCounterMode_ (eventNumber could advance far slower than
+    // runCount_, e.g. eventCounterMode_=="tracks" with a low tracking rate).
     bool clustersBreach = (warningMinClustersPerEvent_ > 0.0) && (nPlanes > 0) &&
-                          (avgClusters < warningMinClustersPerEvent_) && (eventNumber > updateNumber * 2);
+                          (avgClusters < warningMinClustersPerEvent_) && (runCount_ > updateNumber * 2);
     bool tracksBreach = (warningMinTracksPerEvent_ > 0.0) &&
-                        (tracksPerEvent < warningMinTracksPerEvent_) && (eventNumber > updateNumber * 2);
+                        (tracksPerEvent < warningMinTracksPerEvent_) && (runCount_ > updateNumber * 2);
     bool belowThreshold = clustersBreach || tracksBreach;
 
     if(belowThreshold) {
@@ -622,285 +720,6 @@ void OnlineMonitor::checkWarningMode() {
     }
 }
 
-void OnlineMonitor::sendDiscordPayload(const std::string& jsonPath) {
-    static const std::string snapPath = "/tmp/corry_snap.png";
-    gui->canvas->GetCanvas()->Print(snapPath.c_str());
-    std::string cmd = "curl -s -X POST"
-                      " -F \"payload_json=$(cat '" + jsonPath + "')\""
-                      " -F \"file=@'" + snapPath + "';filename=corry_snap.png\""
-                      " \"" + discordWebhook_ + "\" > /dev/null 2>&1 &";
-    if(system(cmd.c_str()) != 0) {
-        LOG(WARNING) << "Discord command returned non-zero";
-    }
-}
-
-void OnlineMonitor::sendInfluxDB() {
-    if(influxdbUrl_.empty()) return;
-
-    auto now_sys    = std::chrono::system_clock::now();
-    auto now_steady = std::chrono::steady_clock::now();
-    long long ts    = std::chrono::duration_cast<std::chrono::nanoseconds>(now_sys.time_since_epoch()).count();
-    double elapsed  = std::chrono::duration<double>(now_steady - runStartTime_).count();
-
-    int ev = (influxEventAccum_ > 0) ? influxEventAccum_ : 1;
-    double tracksPerEvent = static_cast<double>(influxTrackAccum_) / ev;
-
-    std::string lines;
-
-    // イベントレート系
-    lines += "corry_rate event_rate=" + std::to_string(eventRate_) +
-             ",tracks_per_event=" + std::to_string(tracksPerEvent) +
-             ",event_number=" + std::to_string(eventNumber) +
-             " " + std::to_string(ts) + "\n";
-
-    // ランステータス・警告状態
-    lines += "corry_status elapsed_seconds=" + std::to_string(elapsed) +
-             ",warning_active=" + std::to_string(warningModeActive_ ? 1 : 0) +
-             " " + std::to_string(ts) + "\n";
-
-    // 検出器ごとのクラスター数
-    for(auto& [detName, hits] : influxHitAccum_) {
-        double cpe = static_cast<double>(hits) / ev;
-        std::string tag = detName;
-        for(char& c : tag) if(c == ' ') c = '_';
-        lines += "corry_detector,detector=" + tag +
-                 " clusters_per_event=" + std::to_string(cpe) +
-                 " " + std::to_string(ts) + "\n";
-        hits = 0;
-    }
-    influxTrackAccum_ = 0;
-    influxEventAccum_ = 0;
-
-    // ROOTヒストグラムから統計値を取得するヘルパー
-    auto readHist = [](const std::string& path, double& mean, double& rms) -> bool {
-        auto* h = static_cast<TH1*>(gDirectory->Get(("/" + path).c_str()));
-        if(!h || h->GetEntries() == 0) return false;
-        mean = h->GetMean();
-        rms  = h->GetRMS();
-        return true;
-    };
-
-    // Track χ²/ndof
-    {
-        double mean, rms;
-        if(readHist(trackingModule + "/trackChi2ndof", mean, rms)) {
-            lines += "corry_tracking chi2ndof_mean=" + std::to_string(mean) +
-                     " " + std::to_string(ts) + "\n";
-        }
-    }
-
-    // 検出器ごと: Residual X/Y RMS、クラスターサイズ
-    for(auto& det : get_detectors()) {
-        if(ignoreAux && det->isAuxiliary()) continue;
-        if(det->hasRole(DetectorRole::PASSIVE)) continue;
-        const std::string& name = det->getName();
-        std::string tag = name;
-        for(char& c : tag) if(c == ' ') c = '_';
-
-        double mean, rms;
-        if(readHist(trackingModule + "/" + name + "/local_residuals/LocalResidualsX", mean, rms)) {
-            lines += "corry_residual,detector=" + tag + ",axis=X" +
-                     " mean=" + std::to_string(mean) + ",rms=" + std::to_string(rms) +
-                     " " + std::to_string(ts) + "\n";
-        }
-        if(readHist(trackingModule + "/" + name + "/local_residuals/LocalResidualsY", mean, rms)) {
-            lines += "corry_residual,detector=" + tag + ",axis=Y" +
-                     " mean=" + std::to_string(mean) + ",rms=" + std::to_string(rms) +
-                     " " + std::to_string(ts) + "\n";
-        }
-        if(readHist(clusteringModule + "/" + name + "/clusterSize", mean, rms)) {
-            lines += "corry_cluster,detector=" + tag +
-                     " mean_size=" + std::to_string(mean) +
-                     " " + std::to_string(ts) + "\n";
-        }
-    }
-
-    // スナップショット保存（最新画像の上書き）
-    if(!autoSaveDir_.empty()) {
-        gui->SaveCanvas(autoSaveDir_ + "latest.png");
-    }
-
-    // InfluxDBへ送信
-    std::string tmpPath = "/tmp/corry_influx.lp";
-    {
-        std::ofstream f(tmpPath);
-        if(!f) { LOG(WARNING) << "Cannot write InfluxDB payload to " << tmpPath; return; }
-        f << lines;
-    }
-    std::string cmd = "curl -s -X POST"
-        " \"" + influxdbUrl_ + "/api/v2/write?org=" + influxdbOrg_ +
-        "&bucket=" + influxdbBucket_ + "&precision=ns\""
-        " -H \"Authorization: Token " + influxdbToken_ + "\""
-        " -H \"Content-Type: text/plain; charset=utf-8\""
-        " --data-binary @'" + tmpPath + "' > /dev/null 2>&1 &";
-    if(system(cmd.c_str()) != 0) {
-        LOG(WARNING) << "InfluxDB curl command returned non-zero";
-    }
-}
-
-void OnlineMonitor::checkDiscordAlert() {
-    if(discordWebhook_.empty()) return;
-
-    auto now = std::chrono::steady_clock::now();
-
-    if(eventRate_ < discordMinRate_) {
-        if(!discordAlertActive_) {
-            discordAlertActive_ = true;
-            discordBelowSince_ = now;
-            discordNotificationSent_ = false;
-            LOG(INFO) << "Trigger rate " << std::fixed << std::setprecision(1) << eventRate_
-                      << " evt/s dropped below threshold " << discordMinRate_ << " evt/s";
-        } else if(!discordNotificationSent_) {
-            double elapsed = std::chrono::duration<double>(now - discordBelowSince_).count();
-            if(elapsed >= static_cast<double>(discordAlertDuration_)) {
-                sendDiscordAlert();
-                discordNotificationSent_ = true;
-            }
-        }
-    } else {
-        if(discordAlertActive_ && discordNotificationSent_) {
-            sendDiscordRecovery();
-        } else if(discordAlertActive_) {
-            LOG(INFO) << "Trigger rate recovered before alert was sent";
-        }
-        discordAlertActive_ = false;
-        discordNotificationSent_ = false;
-    }
-}
-
-void OnlineMonitor::sendDiscordAlert() {
-    std::string tmpPath = "/tmp/corry_discord_alert.json";
-    {
-        std::ofstream f(tmpPath);
-        if(!f) {
-            LOG(ERROR) << "Cannot write Discord payload to " << tmpPath;
-            return;
-        }
-        double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - discordBelowSince_).count();
-        f << std::fixed << std::setprecision(1);
-        f << "{\"embeds\":[{";
-        f << "\"title\":\"\\u26a0\\ufe0f Low Trigger Rate\",";
-        f << "\"color\":16711680,";
-        f << "\"fields\":[";
-        f << "{\"name\":\"Current Rate\",\"value\":\"" << eventRate_ << " evt\\/s\",\"inline\":true},";
-        f << "{\"name\":\"Threshold\",\"value\":\"" << discordMinRate_ << " evt\\/s\",\"inline\":true},";
-        f << "{\"name\":\"Duration\",\"value\":\"" << static_cast<int>(elapsed) << " s\",\"inline\":true}";
-        f << "],\"image\":{\"url\":\"attachment://corry_snap.png\"}}]}";
-    }
-    sendDiscordPayload(tmpPath);
-    LOG(INFO) << "Discord alert sent: " << std::fixed << std::setprecision(1)
-              << eventRate_ << " evt/s < " << discordMinRate_ << " evt/s";
-}
-
-void OnlineMonitor::sendDiscordRecovery() {
-    std::string tmpPath = "/tmp/corry_discord_recovery.json";
-    {
-        std::ofstream f(tmpPath);
-        if(!f) return;
-        f << std::fixed << std::setprecision(1);
-        f << "{\"embeds\":[{";
-        f << "\"title\":\"\\u2705 Trigger Rate Recovered\",";
-        f << "\"color\":3066993,";
-        f << "\"fields\":[";
-        f << "{\"name\":\"Current Rate\",\"value\":\"" << eventRate_ << " evt\\/s\",\"inline\":true},";
-        f << "{\"name\":\"Threshold\",\"value\":\"" << discordMinRate_ << " evt\\/s\",\"inline\":true}";
-        f << "],\"image\":{\"url\":\"attachment://corry_snap.png\"}}]}";
-    }
-    sendDiscordPayload(tmpPath);
-    LOG(INFO) << "Discord recovery sent: " << std::fixed << std::setprecision(1) << eventRate_ << " evt/s";
-}
-
-void OnlineMonitor::checkPlaneAlerts() {
-    if(discordWebhook_.empty()) return;
-    if(discordMaxHitRate_ <= 0.0 && discordMinHitRate_ <= 0.0) return;
-
-    auto now = std::chrono::steady_clock::now();
-
-    // Compute rates from accumulated data and reset counters
-    for(auto& td : gui->timelineHitData_) {
-        int ev = planeEventAccum_[td.detectorName];
-        if(ev > 0) {
-            planeHitRate_[td.detectorName] =
-                static_cast<double>(planeHitAccum_[td.detectorName]) / ev;
-        }
-        planeHitAccum_[td.detectorName] = 0;
-        planeEventAccum_[td.detectorName] = 0;
-    }
-
-    for(auto& td : gui->timelineHitData_) {
-        const std::string& name = td.detectorName;
-        double rate = planeHitRate_[name];
-        auto& alert = planeAlerts_[name];
-
-        bool tooHigh = (discordMaxHitRate_ > 0.0) && (rate > discordMaxHitRate_);
-        bool tooLow  = (discordMinHitRate_ > 0.0) && (rate < discordMinHitRate_)
-                       && (eventNumber > updateNumber * 2);
-
-        if(tooHigh || tooLow) {
-            if(!alert.active) {
-                alert.active = true;
-                alert.sent = false;
-                alert.since = now;
-                alert.isHighRate = tooHigh;
-            } else if(!alert.sent) {
-                double elapsed = std::chrono::duration<double>(now - alert.since).count();
-                if(elapsed >= static_cast<double>(discordAlertDuration_)) {
-                    sendPlaneAlert(name, rate, tooHigh);
-                    alert.sent = true;
-                }
-            }
-        } else {
-            if(alert.active && alert.sent) {
-                sendPlaneRecovery(name, rate);
-            }
-            alert.active = false;
-            alert.sent = false;
-        }
-    }
-}
-
-void OnlineMonitor::sendPlaneAlert(const std::string& detName, double rate, bool isHigh) {
-    std::string tmpPath = "/tmp/corry_plane_alert.json";
-    {
-        std::ofstream f(tmpPath);
-        if(!f) return;
-        f << std::fixed << std::setprecision(2);
-        double threshold = isHigh ? discordMaxHitRate_ : discordMinHitRate_;
-        std::string title = isHigh ? "\\u2b06 High Hit Rate: " : "\\u2b07 Low Hit Rate: ";
-        int color = isHigh ? 15158332 : 3447003;  // red : blue
-        f << "{\"embeds\":[{";
-        f << "\"title\":\"" << title << detName << "\",";
-        f << "\"color\":" << color << ",";
-        f << "\"fields\":[";
-        f << "{\"name\":\"Plane\",\"value\":\"" << detName << "\",\"inline\":true},";
-        f << "{\"name\":\"Hit Rate\",\"value\":\"" << rate << " clusters\\/evt\",\"inline\":true},";
-        f << "{\"name\":\"Threshold\",\"value\":\"" << threshold << " clusters\\/evt\",\"inline\":true}";
-        f << "],\"image\":{\"url\":\"attachment://corry_snap.png\"}}]}";
-    }
-    sendDiscordPayload(tmpPath);
-    LOG(INFO) << "Plane " << detName << " hit rate " << std::fixed << std::setprecision(2) << rate
-              << " clusters/evt is " << (isHigh ? "above max" : "below min") << " threshold";
-}
-
-void OnlineMonitor::sendPlaneRecovery(const std::string& detName, double rate) {
-    std::string tmpPath = "/tmp/corry_plane_recovery.json";
-    {
-        std::ofstream f(tmpPath);
-        if(!f) return;
-        f << std::fixed << std::setprecision(2);
-        f << "{\"embeds\":[{";
-        f << "\"title\":\"\\u2705 Hit Rate Recovered: " << detName << "\",";
-        f << "\"color\":3066993,";
-        f << "\"fields\":[";
-        f << "{\"name\":\"Plane\",\"value\":\"" << detName << "\",\"inline\":true},";
-        f << "{\"name\":\"Hit Rate\",\"value\":\"" << rate << " clusters\\/evt\",\"inline\":true}";
-        f << "],\"image\":{\"url\":\"attachment://corry_snap.png\"}}]}";
-    }
-    sendDiscordPayload(tmpPath);
-    LOG(INFO) << "Plane " << detName << " hit rate recovered to " << std::fixed
-              << std::setprecision(2) << rate << " clusters/evt";
-}
-
 void OnlineMonitor::fillTimeline(const std::shared_ptr<Clipboard>& clipboard) {
     double ev = static_cast<double>(eventNumber);
 
@@ -908,10 +727,7 @@ void OnlineMonitor::fillTimeline(const std::shared_ptr<Clipboard>& clipboard) {
         auto& clusters = clipboard->getData<Cluster>(td.detectorName);
         double n = static_cast<double>(clusters.size());
         td.profile->Fill(ev, n);
-        planeHitAccum_[td.detectorName] += static_cast<int>(clusters.size());
-        planeEventAccum_[td.detectorName]++;
         warnClusterAccum_[td.detectorName] += static_cast<int>(clusters.size());
-        influxHitAccum_[td.detectorName] += static_cast<int>(clusters.size());
 
         // Telescope: fill cluster hit positions in the z-x and z-y projections
         if(telescopeHitXZ_ && telescopeHitYZ_) {
@@ -923,13 +739,11 @@ void OnlineMonitor::fillTimeline(const std::shared_ptr<Clipboard>& clipboard) {
         }
     }
     warnEventAccum_++;
-    influxEventAccum_++;
 
     if(profile_tracks_) {
         auto& tracks = clipboard->getData<Track>();
         profile_tracks_->Fill(ev, static_cast<double>(tracks.size()));
         warnTrackAccum_ += static_cast<int>(tracks.size());
-        influxTrackAccum_ += static_cast<int>(tracks.size());
 
         // Telescope: store intercept points of each track at every detector plane
         if(!telescopeDetZ_.empty()) {
@@ -1018,20 +832,74 @@ void OnlineMonitor::fillCorrelation(const std::shared_ptr<Clipboard>& clipboard)
     }
 }
 
+void OnlineMonitor::fillResidualTrend(const std::shared_ptr<Clipboard>& clipboard) {
+    if(residualTrendData_.empty()) return;
+
+    auto& tracks = clipboard->getData<Track>();
+    double ev = static_cast<double>(eventNumber);
+
+    for(auto& rd : residualTrendData_) {
+        for(auto& track : tracks) {
+            if(rd.isDut) {
+                // DUTs are excluded from the fit, so Track has no residual_local_ entry for them
+                // (getLocalResidual() would throw). Compute the same quantity AnalysisDUT does:
+                // track intercept vs. the closest DUTAssociation-associated cluster, in local
+                // coordinates. No associated cluster this event -> nothing to plot (e.g. genuine
+                // DUT inefficiency), not a 0.
+                auto closest = track->getClosestCluster(rd.detectorName);
+                if(!closest) continue;
+                auto detector = get_detector(rd.detectorName);
+                auto intercept = detector->getLocalIntercept(track.get());
+                rd.profileX->Fill(ev, intercept.X() - closest->local().x());
+                rd.profileY->Fill(ev, intercept.Y() - closest->local().y());
+            } else {
+                // Only detectors actually used in this track's fit have a residual_local_ entry.
+                bool in_fit = false;
+                for(auto* cluster : track->getClusters()) {
+                    if(cluster->detectorID() == rd.detectorName) {
+                        in_fit = true;
+                        break;
+                    }
+                }
+                if(!in_fit) continue;
+                auto localRes = track->getLocalResidual(rd.detectorName);
+                rd.profileX->Fill(ev, localRes.x());
+                rd.profileY->Fill(ev, localRes.y());
+            }
+        }
+    }
+
+    // Keep bin count bounded (same rebin logic as fillTimeline/fillCorrelation)
+    auto rebinIfNeeded = [this](TProfile* p) {
+        if(!p) return;
+        int n = p->GetNbinsX();
+        if(n > timelineNBins_) p->RebinX(n / timelineNBins_);
+    };
+    for(auto& rd : residualTrendData_) {
+        rebinIfNeeded(rd.profileX);
+        rebinIfNeeded(rd.profileY);
+    }
+}
+
 void OnlineMonitor::gui_update() {
     auto now = std::chrono::steady_clock::now();
     double wallElapsed = std::chrono::duration<double>(now - lastUpdateTime_).count();
 
-    // Trigger display update every updateNumber events, rate refresh every 5 s (for Discord)
-    bool eventCycle = !gui->isPaused() && (eventNumber > 0) && (eventNumber % updateNumber == 0);
+    // Trigger display update once eventNumber has advanced by at least updateNumber since the last
+    // update (a delta check rather than eventNumber % updateNumber == 0: eventCounterMode_ can advance
+    // eventNumber by more than one -- or not at all -- per run() call, so an exact multiple could be
+    // stepped over). Rate refresh (status bar "Rate: X evt/s") every 5 s regardless, using runCount_
+    // (real event rate, independent of eventCounterMode_) rather than eventNumber.
+    bool eventCycle = !gui->isPaused() && (eventNumber - lastUpdateEventNumber_ >= updateNumber);
     bool wallClock = (wallElapsed >= 5.0);
 
     if(eventCycle || wallClock) {
         if(wallElapsed > 0) {
-            eventRate_ = static_cast<double>(eventNumber - lastUpdateEventNumber_) / wallElapsed;
+            eventRate_ = static_cast<double>(runCount_ - lastUpdateRunCount_) / wallElapsed;
         }
         lastUpdateTime_ = now;
         lastUpdateEventNumber_ = eventNumber;
+        lastUpdateRunCount_ = runCount_;
 
         if(eventCycle) {
             if(gui->currentCanvas_ == "TelescopeCanvas") {
@@ -1042,10 +910,7 @@ void OnlineMonitor::gui_update() {
         }
         gui->updateStatus(eventNumber, eventRate_);
         gui->updateProgress(eventNumber, targetEvents_);
-        checkDiscordAlert();
-        checkPlaneAlerts();
         checkWarningMode();
-        sendInfluxDB();
 
         // Auto-save current canvas
         if(autoSaveInterval_ > 0) {

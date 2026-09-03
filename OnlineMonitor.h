@@ -68,6 +68,9 @@ namespace corryvreckan {
                       std::string detector_name = "");
         void AddHisto(std::string, std::string, std::string style = "", bool logy = false);
 
+        // How much to add to eventNumber for the event just processed -- depends on event_counter_
+        int computeEventIncrement(const std::shared_ptr<Clipboard>& clipboard);
+
         // Member variables
         int eventNumber;
         int updateNumber;
@@ -77,6 +80,18 @@ namespace corryvreckan {
 
         std::string clusteringModule;
         std::string trackingModule;
+
+        // What eventNumber (displayed Events count, progress bar, Timeline/Corr Trends X-axis) counts.
+        // Independent of runCount_ below, which rate-style metrics (status bar "Rate: X evt/s", warning
+        // mode's clusters/tracks-per-event) always use as their denominator -- see run()/gui_update().
+        enum class EventCounterMode { RunCount, Tracks, DutAssociatedTracks };
+        EventCounterMode eventCounterMode_ = EventCounterMode::RunCount;
+        std::string eventCounterDut_;
+        std::string eventCounterLabel_ = "Event"; // axis label matching eventCounterMode_, set in constructor
+
+        // Denominator for rate-style metrics: exactly one per run() call, regardless of eventCounterMode_.
+        int runCount_ = 0;
+        int lastUpdateRunCount_ = 0;
 
         // Canvases and their plots:
         Matrix<std::string> canvas_dutplots, canvas_overview, canvas_tracking, canvas_hitmaps, canvas_residuals, canvas_cx,
@@ -90,6 +105,22 @@ namespace corryvreckan {
         // Timeline profiles (filled in run())
         TProfile* profile_tracks_ = nullptr;
         int timelineNBins_;
+
+        // Residual-vs-event trend (Residuals tab): one X/Y TProfile pair per detector, including
+        // DUTs. Booked in initialize() *before* gui_run() so AddHisto() can find them via
+        // gDirectory when the Residuals canvas is built (unlike the config-driven residuals_
+        // matrix, added individually in gui_run() so DUTs aren't excluded by that canvas's
+        // ignoreDut=true). Non-DUT residuals come from Track::getLocalResidual() (same quantity
+        // Tracking4D itself fills into LocalResidualsX/Y); DUT residuals are computed the same way
+        // AnalysisDUT does, from the closest DUTAssociation-associated cluster.
+        struct ResidualTrendData {
+            std::string detectorName;
+            bool isDut = false;
+            TProfile* profileX = nullptr;
+            TProfile* profileY = nullptr;
+        };
+        std::vector<ResidualTrendData> residualTrendData_;
+        void fillResidualTrend(const std::shared_ptr<Clipboard>& clipboard);
 
         // Telescope view histograms and detector z positions
         TH2F* telescopeHitXZ_ = nullptr;
@@ -105,28 +136,6 @@ namespace corryvreckan {
         int autoSaveInterval_;
         std::string autoSaveDir_;
         std::chrono::steady_clock::time_point lastAutoSaveTime_;
-
-        // Discord alert — trigger rate
-        std::string discordWebhook_;
-        double discordMinRate_;
-        int discordAlertDuration_;
-        bool discordAlertActive_ = false;
-        bool discordNotificationSent_ = false;
-        std::chrono::steady_clock::time_point discordBelowSince_;
-
-        // Discord alert — per-plane hit rate
-        double discordMaxHitRate_;
-        double discordMinHitRate_;
-        struct PlaneAlertState {
-            bool active = false;
-            bool sent = false;
-            std::chrono::steady_clock::time_point since;
-            bool isHighRate = false;
-        };
-        std::map<std::string, PlaneAlertState> planeAlerts_;
-        std::map<std::string, int> planeHitAccum_;
-        std::map<std::string, int> planeEventAccum_;
-        std::map<std::string, double> planeHitRate_;
 
         // Warning mode — low cluster/event or track/event
         double warningMinClustersPerEvent_;
@@ -144,25 +153,7 @@ namespace corryvreckan {
         void gui_update();
         void fillTimeline(const std::shared_ptr<Clipboard>& clipboard);
         void fillCorrelation(const std::shared_ptr<Clipboard>& clipboard);
-        void checkDiscordAlert();
-        void sendDiscordAlert();
-        void sendDiscordRecovery();
-        void checkPlaneAlerts();
-        void sendPlaneAlert(const std::string& detName, double rate, bool isHigh);
-        void sendPlaneRecovery(const std::string& detName, double rate);
-        void sendDiscordPayload(const std::string& jsonPath);
         void checkWarningMode();
-
-        // InfluxDB
-        std::string influxdbUrl_;
-        std::string influxdbToken_;
-        std::string influxdbOrg_;
-        std::string influxdbBucket_;
-        std::map<std::string, int> influxHitAccum_;
-        int influxTrackAccum_ = 0;
-        int influxEventAccum_ = 0;
-        std::chrono::steady_clock::time_point runStartTime_;
-        void sendInfluxDB();
     };
 } // namespace corryvreckan
 #endif // OnlineMonitor_H

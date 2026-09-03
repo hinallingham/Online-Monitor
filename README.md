@@ -42,8 +42,7 @@ Canvases refresh automatically every `update` events **or** every 5 seconds — 
 | 📉 **Corr Trends canvas** | Per-event ΔX / ΔY global [mm] vs event number — early warning for alignment drift |
 | 🔢 **L1idC canvas** | l1idC vs event, wall-clock time vs event, inter-plane sync delta, coincidence rate — DAQ health at a glance |
 | 🔭 **Telescope canvas** | Live 3D track intercepts and cluster hits in Z-X / Z-Y projections |
-| 📡 **Discord alerts** | Webhook notifications for low trigger rate and per-plane hit rate anomalies, with canvas screenshot attached |
-| 🔔 **Auto-recovery notify** | Automatic Discord recovery message when conditions return to normal |
+| ⚠️ **Warning mode** | GUI-only low-rate warning (status bar turns red) when clusters/event or tracks/event drops below threshold |
 | 📏 **Progress bar** | Color-coded event counter (blue → orange → green) toward a configurable target |
 | 📺 **Full-screen mode** | Expand any canvas to full display resolution with one click or keypress |
 | 💾 **Auto-save** | Periodic canvas export as timestamped PNG |
@@ -58,7 +57,7 @@ Canvases refresh automatically every `update` events **or** every 5 seconds — 
 |---|---|---|
 | **Overview** | Tracking | Reference: cluster charge, hitmap, residual X |
 | **Tracking Performance** | Tracking | χ², angle X/Y, χ²/ndf, tracks/event, clusters/track |
-| **Residuals** | Tracking | Local residual X per detector |
+| **Residuals** | Tracking | Local residual X per detector, plus a live Residual X/Y vs. event trend per detector (incl. DUTs) — see **Residual Trend** below |
 | **Timeline** | Tracking | Clusters/event per detector (top) + tracks/event (bottom), rolling TProfile |
 | **Telescope** | Tracking | Live track intercepts and cluster hit positions in Z-X / Z-Y projections |
 | **Corr Trends** | Tracking | ΔX / ΔY global [mm] vs event number per non-reference detector — alignment drift monitor |
@@ -76,6 +75,50 @@ Plot paths support three substitution keywords:
 - `%REFERENCE%` — replaced with the reference detector name
 
 Add `"log"` as the draw option to switch the Y axis to a logarithmic scale.
+
+---
+
+### 🔢 Event counter
+
+There are two independent notions of "event" in this module:
+
+- **Displayed Events count** — status bar, progress bar, and the X-axis of the Timeline/Corr Trends
+  canvases. Selected by `event_counter`: one per `run()` call as before (`"run_count"`), cumulative
+  `Tracking4D` tracks (`"tracks"`), or cumulative tracks associated to a DUT cluster
+  (`"dut_associated_tracks"`, e.g. via `DUTAssociation`). With either track-based mode, this count can
+  advance by more than one — or not at all — per `run()` call, since one Corryvreckan event can contain
+  several tracks or none.
+- **Rate-style metrics' denominator** — the status bar's `Rate: X evt/s` and warning mode's
+  `clusters/event`/`tracks/event` thresholds. These always use one per `run()` call, regardless of
+  `event_counter`: if "event" itself meant "a track", `tracks/event` would be meaningless (numerator and
+  denominator would be the same quantity).
+
+This split exists because the two `Tracking4D`-based `event_counter` modes were added specifically to
+work around a Corryvreckan event definition that can overcount (see the module header comment in
+`EventLoaderMALTA` and its README) — the displayed count needed to change, but the rate metrics deriving
+from it should not silently change meaning.
+
+---
+
+### 📐 Residual Trend
+
+The Residuals canvas includes a live `Residual X vs. Event` / `Residual Y vs. Event` TProfile pair
+per detector, in addition to the static `LocalResidualsX` distribution. Unlike the rest of that
+canvas (config-driven via `residuals`, which excludes DUTs), these two trends are added for every
+detector including DUTs, and are computed by `OnlineMonitor` itself rather than read from another
+module's histogram:
+
+- **Non-DUT (reference/tracking) planes**: `Track::getLocalResidual()` — the same quantity
+  `Tracking4D` itself fills into `LocalResidualsX`/`Y` — for every track that actually used that
+  plane in its fit.
+- **DUT planes**: not part of the fit, so `getLocalResidual()` has no entry for them. Computed the
+  same way `AnalysisDUT` does instead: the track's local intercept at the DUT minus the closest
+  `DUTAssociation`-associated cluster's local position (`Track::getClosestCluster()`). A track with
+  no associated DUT cluster that event contributes nothing (not a spurious 0) — a flat or gappy DUT
+  trend is a genuine efficiency signal, not missing data.
+
+Watching this trend live is a quick way to catch drifting alignment or a developing tracking
+problem mid-run, without waiting for the end-of-run residual distributions.
 
 ---
 
@@ -98,45 +141,25 @@ Add `"log"` as the draw option to switch the Y axis to a logarithmic scale.
 
 ---
 
-### 🔔 Discord Alerts
-
-Set `discord_webhook` to a valid Discord webhook URL to enable all notifications.
-Every message includes the current canvas as an embedded screenshot.
-
-| Alert | Trigger | Color |
-|---|---|---|
-| ⚠️ Low Trigger Rate | Rate < `discord_min_rate` for ≥ `discord_alert_duration` s | 🔴 Red |
-| ✅ Rate Recovered | Rate returns above threshold | 🟢 Green |
-| ⬆️ High Hit Rate | Plane clusters/event > `discord_max_hit_rate` for ≥ duration | 🔴 Red |
-| ⬇️ Low Hit Rate | Plane clusters/event < `discord_min_hit_rate` for ≥ duration | 🔵 Blue |
-| ✅ Hit Rate Recovered | Plane rate returns to normal range | 🟢 Green |
-
----
-
 ### ⚙️ Parameters
 
 #### General
 
 | Parameter | Default | Description |
 |---|---|---|
-| `update` | `200` | Events between canvas refreshes |
+| `update` | `200` | Events between canvas refreshes (in whatever unit `event_counter` selects) |
 | `canvas_title` | `"Corryvreckan Testbeam Monitor"` | GUI window title |
 | `ignore_aux` | `true` | Exclude detectors with auxiliary role |
 | `clustering_module` | `"Clustering4D"` | Source module for clustering plots |
 | `tracking_module` | `"Tracking4D"` | Source module for tracking plots |
-| `target_events` | `0` | Target event count for progress bar (`0` = disabled) |
+| `event_counter` | `"run_count"` | What the displayed Events count (status bar, progress bar, Timeline/Corr Trends X-axis) counts: `"run_count"` (one per module `run()` call, i.e. one per Corryvreckan event as usual), `"tracks"` (cumulative `Tracking4D` tracks found), or `"dut_associated_tracks"` (cumulative tracks with an associated cluster on `event_counter_dut`, e.g. via `DUTAssociation`). Does **not** affect the status bar rate or warning-mode "per event" metrics, which always use one-per-`run()` as their denominator regardless of this setting — see "Event counter" below. |
+| `event_counter_dut` | `""` | Which DUT's associated tracks to count when `event_counter = "dut_associated_tracks"`. Required if the geometry has more than one DUT; auto-selected if there is exactly one. Throws a configuration error at startup if `event_counter = "dut_associated_tracks"` but no DUT is present, or if this names a detector that isn't a DUT. |
+| `target_events` | `0` | Target count for progress bar, in `event_counter` units (`0` = disabled) |
 | `auto_save_interval` | `0` | Auto-save interval in seconds (`0` = disabled) |
 | `auto_save_dir` | `"./"` | Output directory for auto-saved PNGs |
-
-#### Discord
-
-| Parameter | Default | Description |
-|---|---|---|
-| `discord_webhook` | `""` | Webhook URL — empty string disables all alerts |
-| `discord_min_rate` | `100.0` | Trigger rate threshold (evt/s) |
-| `discord_alert_duration` | `30` | Seconds below threshold before alert fires |
-| `discord_max_hit_rate` | `0.0` | Max clusters/event per plane (`0` = disabled) |
-| `discord_min_hit_rate` | `0.0` | Min clusters/event per plane (`0` = disabled) |
+| `warning_min_clusters_per_event` | `0.0` | Warning mode threshold: mean clusters/event across planes (`0` = disabled) |
+| `warning_min_tracks_per_event` | `0.0` | Warning mode threshold: tracks/event (`0` = disabled) |
+| `warning_duration` | `10` | Seconds below either warning threshold before warning mode activates |
 
 #### Canvas overrides
 
@@ -170,16 +193,13 @@ All canvases accept a matrix of `["plot/path", "draw_options"]` rows.
 update = 200
 canvas_title = "Run 00042 — MALTA2 Testbeam"
 clustering_module = "ClusteringSpatial"
+event_counter = "dut_associated_tracks"
+event_counter_dut = "MALTA_1"
 target_events = 1000000
 auto_save_interval = 60
 auto_save_dir = "/data/snapshots/"
-
-# Discord alerts (keep webhook URL out of version control)
-discord_webhook = "https://discord.com/api/webhooks/..."
-discord_min_rate = 50.0
-discord_alert_duration = 20
-discord_max_hit_rate = 5.0
-discord_min_hit_rate = 0.1
+warning_min_tracks_per_event = 0.5
+warning_duration = 20
 
 dut_plots = [["EventLoaderEUDAQ2/%DUT%/hitmap",                          "colz"],
              ["EventLoaderEUDAQ2/%DUT%/hPixelTimes"],
@@ -212,8 +232,7 @@ LinuxはファイルへのConcurrent読み取りアクセスを許可してい�
 | 📉 **Corr Trends キャンバス** | イベント番号に対する ΔX / ΔY グローバル [mm] — アライメントドリフトの早期検出 |
 | 🔢 **L1idC キャンバス** | l1idC vs イベント・実時間 vs イベント・プレーン間 l1idC ズレ・coincidence rate — DAQ 品質を一画面で確認 |
 | 🔭 **Telescope キャンバス** | ライブトラック交点とクラスターヒットを Z-X / Z-Y 投影で表示 |
-| 📡 **Discord通知** | トリガーレート低下・プレーン異常ヒットレートをキャンバスのスクリーンショット付きで通知 |
-| 🔔 **自動復帰通知** | 状態が正常に戻った際に自動でDiscord復帰メッセージを送信 |
+| ⚠️ **Warning mode** | clusters/eventまたはtracks/eventが閾値を下回るとステータスバーが赤くなるGUI限定の低レート警告 |
 | 📏 **プログレスバー** | 目標イベント数に向けた色付きカウンター（青→橙→緑） |
 | 📺 **全画面モード** | ワンクリックまたはキー操作で任意のキャンバスをフルディスプレイ解像度に拡大 |
 | 💾 **自動保存** | タイムスタンプ付きPNGへの定期キャンバスエクスポート |
@@ -228,7 +247,7 @@ LinuxはファイルへのConcurrent読み取りアクセスを許可してい�
 |---|---|---|
 | **Overview** | Tracking | リファレンス：クラスター電荷、ヒットマップ、残差X |
 | **Tracking Performance** | Tracking | χ²、角度X/Y、χ²/ndf、tracks/event、clusters/track |
-| **Residuals** | Tracking | 検出器ごとのローカル残差X |
+| **Residuals** | Tracking | 検出器ごとのローカル残差X、および検出器ごと(DUT含む)のResidual X/Y vs eventトレンド — 詳細は下記「Residualトレンド」参照 |
 | **Timeline** | Tracking | 検出器ごとのclusters/event（上段）+ tracks/event（下段）ローリング |
 | **Telescope** | Tracking | ライブトラック交点・クラスターヒット位置をZ-X / Z-Y投影で表示 |
 | **Corr Trends** | Tracking | 非リファレンス検出器ごとの ΔX / ΔY グローバル [mm] vs イベント番号 — アライメントドリフト検出 |
@@ -246,6 +265,47 @@ LinuxはファイルへのConcurrent読み取りアクセスを許可してい�
 - `%REFERENCE%` — リファレンス検出器名に置換
 
 描画オプションに`"log"`を指定するとY軸を対数スケールに切り替えます。
+
+---
+
+### 🔢 Eventカウンタ
+
+このモジュールには独立した2種類の「event」概念があります。
+
+- **表示上のEvents数** — ステータスバー・プログレスバー・Timeline/Corr TrendsキャンバスのX軸。
+  `event_counter`で選択: 従来通り`run()`1回につき1(`"run_count"`)、`Tracking4D`が見つけたtrackの累積数
+  (`"tracks"`)、DUTのクラスタに紐付いたtrackの累積数(`"dut_associated_tracks"`、`DUTAssociation`等が対象)。
+  track系のモードでは、1回の`run()`で複数trackが見つかれば2以上進み、0本なら進まない。
+- **レート系指標の分母** — ステータスバーの`Rate: X evt/s`、warning modeの`clusters/event`/`tracks/event`。
+  `event_counter`の設定に関わらず、常に`run()`1回につき1を分母として使う。もし「event」自体が
+  「1本のtrack」を意味してしまうと、`tracks/event`が分子と分母が同じものになり意味を失うため。
+
+この分離が存在する理由は、track系の`event_counter`モードが「Corryvreckanのevent定義が実際の数より
+増えてしまう問題」(`EventLoaderMALTA`のREADMEおよびモジュール冒頭コメント参照)への対処として
+追加されたものだからです — 表示上のカウントは変える必要があった一方、そこから派生するレート系指標の
+意味までは変えたくありませんでした。
+
+---
+
+### 📐 Residualトレンド
+
+Residualsキャンバスには、静的な`LocalResidualsX`分布に加えて、検出器ごとの
+`Residual X vs Event` / `Residual Y vs Event` TProfileがライブで表示される。このキャンバスの
+他の項目(config駆動の`residuals`、DUTを除外)とは異なり、この2つのトレンドは**DUTも含めた
+全検出器**に対して追加され、他モジュールのヒストグラムを読むのではなく`OnlineMonitor`自身が
+計算する:
+
+- **非DUT(参照/トラッキング)プレーン**: `Track::getLocalResidual()` — `Tracking4D`自身が
+  `LocalResidualsX`/`Y`に埋めているのと同じ量 — を、そのプレーンが実際にフィットに使われた
+  track全てについて使用
+- **DUTプレーン**: フィットに使われないため`getLocalResidual()`にはエントリが無い。
+  `AnalysisDUT`と同じ方法で計算: trackのDUTでのローカル交点から、最も近い
+  `DUTAssociation`紐付けクラスタ(`Track::getClosestCluster()`)のローカル位置を引く。
+  そのeventで紐付けクラスタが無いtrackは何も寄与しない(見せかけの0にはならない) —
+  DUTトレンドが平坦・途切れ途切れになるのは、データ欠損ではなく本物の効率低下のサイン
+
+このトレンドをライブで見ることで、ラン終了後のresidual分布を待たずに、アライメントの
+ドリフトやトラッキングの不調をラン中に早期発見できる。
 
 ---
 
@@ -268,45 +328,25 @@ LinuxはファイルへのConcurrent読み取りアクセスを許可してい�
 
 ---
 
-### 🔔 Discord通知
-
-`discord_webhook`に有効なDiscord WebhookのURLを設定すると全ての通知が有効になります。
-全てのメッセージに現在のキャンバスのスクリーンショットが埋め込み添付されます。
-
-| 通知 | 発火条件 | 色 |
-|---|---|---|
-| ⚠️ トリガーレート低下 | レート < `discord_min_rate` が `discord_alert_duration` 秒以上継続 | 🔴 赤 |
-| ✅ レート復帰 | レートが閾値を上回る | 🟢 緑 |
-| ⬆️ ヒットレート高すぎ | プレーンのclusters/event > `discord_max_hit_rate` が継続 | 🔴 赤 |
-| ⬇️ ヒットレート低すぎ | プレーンのclusters/event < `discord_min_hit_rate` が継続 | 🔵 青 |
-| ✅ ヒットレート復帰 | プレーンのレートが正常範囲に戻る | 🟢 緑 |
-
----
-
 ### ⚙️ パラメータ
 
 #### 基本設定
 
 | パラメータ | デフォルト | 説明 |
 |---|---|---|
-| `update` | `200` | キャンバス更新間隔（イベント数） |
+| `update` | `200` | キャンバス更新間隔（`event_counter`が選ぶ単位でのイベント数） |
 | `canvas_title` | `"Corryvreckan Testbeam Monitor"` | GUIウィンドウのタイトル |
 | `ignore_aux` | `true` | Auxiliaryロールの検出器を除外する |
 | `clustering_module` | `"Clustering4D"` | クラスタリングプロットのソースモジュール名 |
 | `tracking_module` | `"Tracking4D"` | トラッキングプロットのソースモジュール名 |
-| `target_events` | `0` | プログレスバーの目標イベント数（`0`で無効） |
+| `event_counter` | `"run_count"` | 表示上のEvents数(ステータスバー・プログレスバー・Timeline/Corr TrendsのX軸)が何を数えるか: `"run_count"`(従来通り`run()`1回につき1)、`"tracks"`(`Tracking4D`が見つけたtrackの累積数)、`"dut_associated_tracks"`(`event_counter_dut`にクラスタが紐付いたtrackの累積数、`DUTAssociation`等を想定)。ステータスバーのレート表示・warning modeの"per event"系指標には影響しない(常に`run()`1回=1を分母に使う。詳細は下の「Eventカウンタ」参照) |
+| `event_counter_dut` | `""` | `event_counter = "dut_associated_tracks"`の時に、どのDUTへの紐付けtrackを数えるか。ジオメトリにDUTが複数あれば必須、1枚だけなら自動選択。DUTが1枚もない、または指定した検出器がDUTでない場合は起動時に設定エラーになる |
+| `target_events` | `0` | プログレスバーの目標値（`event_counter`の単位、`0`で無効） |
 | `auto_save_interval` | `0` | 自動保存の間隔（秒、`0`で無効） |
 | `auto_save_dir` | `"./"` | 自動保存PNGの出力先ディレクトリ |
-
-#### Discord設定
-
-| パラメータ | デフォルト | 説明 |
-|---|---|---|
-| `discord_webhook` | `""` | Webhook URL（空文字で全通知を無効化） |
-| `discord_min_rate` | `100.0` | トリガーレート閾値（evt/s） |
-| `discord_alert_duration` | `30` | アラート発火までの継続時間（秒） |
-| `discord_max_hit_rate` | `0.0` | プレーンごとの最大clusters/event（`0`で無効） |
-| `discord_min_hit_rate` | `0.0` | プレーンごとの最小clusters/event（`0`で無効） |
+| `warning_min_clusters_per_event` | `0.0` | Warning mode閾値: 全プレーン平均のclusters/event（`0`で無効） |
+| `warning_min_tracks_per_event` | `0.0` | Warning mode閾値: tracks/event（`0`で無効） |
+| `warning_duration` | `10` | いずれかのwarning閾値を下回ってからwarning modeが有効になるまでの秒数 |
 
 #### キャンバス設定
 
@@ -340,16 +380,13 @@ LinuxはファイルへのConcurrent読み取りアクセスを許可してい�
 update = 200
 canvas_title = "Run 00042 — MALTA2 Testbeam"
 clustering_module = "ClusteringSpatial"
+event_counter = "dut_associated_tracks"
+event_counter_dut = "MALTA_1"
 target_events = 1000000
 auto_save_interval = 60
 auto_save_dir = "/data/snapshots/"
-
-# Discord通知（WebhookのURLはバージョン管理に含めないこと）
-discord_webhook = "https://discord.com/api/webhooks/..."
-discord_min_rate = 50.0
-discord_alert_duration = 20
-discord_max_hit_rate = 5.0
-discord_min_hit_rate = 0.1
+warning_min_tracks_per_event = 0.5
+warning_duration = 20
 
 dut_plots = [["EventLoaderEUDAQ2/%DUT%/hitmap",                          "colz"],
              ["EventLoaderEUDAQ2/%DUT%/hPixelTimes"],
