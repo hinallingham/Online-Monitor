@@ -32,16 +32,12 @@ OnlineMonitor::OnlineMonitor(Configuration& config, std::vector<std::shared_ptr<
     config_.setDefault<bool>("ignore_aux", true);
     config_.setDefault<std::string>("clustering_module", "Clustering4D");
     config_.setDefault<std::string>("tracking_module", "Tracking4D");
-    config_.setDefault<std::string>("event_counter", "run_count");
-    config_.setDefault<std::string>("event_counter_dut", "");
 
+    config_.setDefault<int>("display_max_bins_1d", 2000);
+    config_.setDefault<int>("display_max_bins_2d", 300);
     config_.setDefault<int>("target_events", 0);
     config_.setDefault<int>("auto_save_interval", 0);
     config_.setDefault<std::string>("auto_save_dir", "./");
-    config_.setDefault<int>("telescope_reset_tracks", 0);
-    config_.setDefault<double>("warning_min_clusters_per_event", 0.0);
-    config_.setDefault<double>("warning_min_tracks_per_event", 0.0);
-    config_.setDefault<int>("warning_duration", 10);
 
     canvasTitle = config_.get<std::string>("canvas_title");
     updateNumber = config_.get<int>("update");
@@ -49,68 +45,33 @@ OnlineMonitor::OnlineMonitor(Configuration& config, std::vector<std::shared_ptr<
     clusteringModule = config_.get<std::string>("clustering_module");
     trackingModule = config_.get<std::string>("tracking_module");
 
-    // event_counter selects what eventNumber (displayed Events count, progress bar, Timeline/Corr Trends
-    // X-axis) counts. Rate-style metrics (status bar "Rate: X evt/s", warning mode's clusters/tracks-per-
-    // event) are unaffected -- they always use one-per-run() as their denominator (runCount_), since
-    // "tracks per event" would be meaningless if "event" itself already meant "a track".
-    std::string event_counter_str = config_.get<std::string>("event_counter");
-    if(event_counter_str == "run_count") {
-        eventCounterMode_ = EventCounterMode::RunCount;
-        eventCounterLabel_ = "Event";
-    } else if(event_counter_str == "tracks") {
-        eventCounterMode_ = EventCounterMode::Tracks;
-        eventCounterLabel_ = "Track";
-    } else if(event_counter_str == "dut_associated_tracks") {
-        eventCounterMode_ = EventCounterMode::DutAssociatedTracks;
-        eventCounterLabel_ = "DUT-associated Track";
-    } else {
-        throw InvalidValueError(
-            config_, "event_counter", "Must be one of \"run_count\", \"tracks\", \"dut_associated_tracks\"");
+    // EventLoaderMALTA builds one Corryvreckan event per l1id(C) and only puts hits carrying that
+    // l1id on the clipboard, so "every reference plane has a hit in this event" is the same as "the
+    // hits on every reference plane share one l1id". DUTs are exempt, as in EventLoaderMALTA's own
+    // coincidence requirement: requiring them would stop the count whenever the DUT is inefficient.
+    for(auto& det : get_regular_detectors(false)) {
+        coincidencePlanes_.push_back(det->getName());
     }
-
-    if(eventCounterMode_ == EventCounterMode::DutAssociatedTracks) {
-        auto duts = get_duts();
-        if(duts.empty()) {
-            throw InvalidValueError(
-                config_, "event_counter", "event_counter=\"dut_associated_tracks\" requires at least one DUT in the geometry");
-        }
-        eventCounterDut_ = config_.get<std::string>("event_counter_dut");
-        if(eventCounterDut_.empty()) {
-            if(duts.size() > 1) {
-                throw InvalidValueError(config_,
-                                        "event_counter_dut",
-                                        "Multiple DUTs in geometry -- event_counter_dut must specify which one to "
-                                        "count associated tracks for");
-            }
-            eventCounterDut_ = duts.front()->getName();
-        } else if(std::none_of(duts.begin(), duts.end(), [&](auto& d) { return d->getName() == eventCounterDut_; })) {
-            throw InvalidValueError(config_, "event_counter_dut", "\"" + eventCounterDut_ + "\" is not a DUT in the geometry");
-        }
-        LOG(STATUS) << "Event counter: DUT-associated tracks on \"" << eventCounterDut_ << "\"";
-    } else if(eventCounterMode_ == EventCounterMode::Tracks) {
-        LOG(STATUS) << "Event counter: tracks";
+    if(coincidencePlanes_.empty()) {
+        throw ModuleError("Counting coincident l1ids requires at least one non-DUT reference plane");
     }
+    LOG(STATUS) << "Event counter: l1ids coincident on all " << coincidencePlanes_.size() << " reference planes";
 
     targetEvents_ = config_.get<int>("target_events");
     autoSaveInterval_ = config_.get<int>("auto_save_interval");
     autoSaveDir_ = config_.get<std::string>("auto_save_dir");
-    telescopeResetTracks_ = config_.get<int>("telescope_reset_tracks");
-    warningMinClustersPerEvent_ = config_.get<double>("warning_min_clusters_per_event");
-    warningMinTracksPerEvent_ = config_.get<double>("warning_min_tracks_per_event");
-    warningDuration_ = config_.get<int>("warning_duration");
 
     config_.setDefaultMatrix<std::string>("overview",
                                           {{trackingModule + "/trackChi2ndof"},
                                            {clusteringModule + "/%REFERENCE%/clusterCharge"},
                                            {"Correlations/%REFERENCE%/hitmap", "colz"},
                                            {trackingModule + "/%REFERENCE%/local_residuals/LocalResidualsX"}});
+    // MALTA2 DUT: where it was hit, how well it lines up with the tracks, and how efficient it is
     config_.setDefaultMatrix<std::string>("dut_plots",
-                                          {{"EventLoaderEUDAQ2/%DUT%/hitmap", "colz"},
-                                           {"EventLoaderEUDAQ2/%DUT%/hPixelTimes"},
-                                           {"EventLoaderEUDAQ2/%DUT%/hPixelRawValues"},
-                                           {"EventLoaderEUDAQ2/%DUT%/hPixelMultiplicityPerCorryEvent", "log"},
-                                           {"AnalysisDUT/%DUT%/clusterChargeAssociated"},
-                                           {"AnalysisDUT/%DUT%/associatedTracksVersusTime"}});
+                                          {{"Correlations/%DUT%/hitmap", "colz"},
+                                           {"OnlineMonitor/dut_residual_x_%DUT%"},
+                                           {"OnlineMonitor/dut_residual_y_%DUT%"},
+                                           {"AnalysisEfficiency/%DUT%/chipEfficiencyMap_trackPos_TProfile", "colz"}});
 
     config_.setDefaultMatrix<std::string>("tracking",
                                           {{trackingModule + "/trackChi2"},
@@ -122,11 +83,13 @@ OnlineMonitor::OnlineMonitor(Configuration& config, std::vector<std::shared_ptr<
 
     config_.setDefaultMatrix<std::string>("hitmaps", {{"Correlations/%DETECTOR%/hitmap", "colz"}});
     config_.setDefaultMatrix<std::string>("residuals", {{trackingModule + "/%DETECTOR%/local_residuals/LocalResidualsX"}});
+    config_.setDefaultMatrix<std::string>("residuals_y", {{trackingModule + "/%DETECTOR%/local_residuals/LocalResidualsY"}});
     config_.setDefaultMatrix<std::string>("correlation_x", {{"Correlations/%DETECTOR%/correlationX"}});
     config_.setDefaultMatrix<std::string>("correlation_x2d", {{"Correlations/%DETECTOR%/correlationX_2Dlocal", "colz"}});
     config_.setDefaultMatrix<std::string>("correlation_y", {{"Correlations/%DETECTOR%/correlationY"}});
     config_.setDefaultMatrix<std::string>("correlation_y2d", {{"Correlations/%DETECTOR%/correlationY_2Dlocal", "colz"}});
-    config_.setDefaultMatrix<std::string>("charge_distributions", {{clusteringModule + "/%DETECTOR%/clusterCharge"}});
+    // MALTA2 is a binary readout: there is no charge, so cluster size takes the place of a charge spectrum
+    config_.setDefaultMatrix<std::string>("cluster_size", {{clusteringModule + "/%DETECTOR%/clusterSize"}});
     config_.setDefaultMatrix<std::string>("event_times", {{"Correlations/%DETECTOR%/eventTimes"}});
 
     // Set up overview plots:
@@ -137,20 +100,21 @@ OnlineMonitor::OnlineMonitor(Configuration& config, std::vector<std::shared_ptr<
     canvas_tracking = config_.getMatrix<std::string>("tracking");
     canvas_hitmaps = config_.getMatrix<std::string>("hitmaps");
     canvas_residuals = config_.getMatrix<std::string>("residuals");
+    canvas_residuals_y = config_.getMatrix<std::string>("residuals_y");
 
     canvas_cx = config_.getMatrix<std::string>("correlation_x");
     canvas_cx2d = config_.getMatrix<std::string>("correlation_x2d");
     canvas_cy = config_.getMatrix<std::string>("correlation_y");
     canvas_cy2d = config_.getMatrix<std::string>("correlation_y2d");
 
-    canvas_charge = config_.getMatrix<std::string>("charge_distributions");
+    canvas_cluster_size = config_.getMatrix<std::string>("cluster_size");
     canvas_time = config_.getMatrix<std::string>("event_times");
 }
 
 void OnlineMonitor::initialize() {
-    // Residual-vs-event trend TProfiles must be booked *before* gui_run() below: gui_run() builds
-    // the Residuals canvas immediately, and AddHisto() only finds histograms that already exist
-    // in gDirectory at that point (see residualTrendData_'s doc comment in the header).
+    // Residual trend TProfiles and DUT residual distributions must be booked *before* gui_run()
+    // below: gui_run() hands the trends to the GUI and builds the DUT canvas immediately, and
+    // AddHisto() only finds histograms that already exist in gDirectory at that point.
     {
         static constexpr int kResidualTrendNBins = 200;
         const double residualXMax = static_cast<double>(kResidualTrendNBins * updateNumber);
@@ -162,15 +126,30 @@ void OnlineMonitor::initialize() {
             rd.detectorName = det->getName();
             rd.isDut = det->isDUT();
 
-            std::string titleX = det->getName() + " Residual X vs Event;Event;Local Residual X [mm]";
+            // No main title: the profiles are overlaid, and the legend names the plane
+            std::string titleX = ";" + trendAxisLabel_ + ";Local Residual X [mm]";
             rd.profileX = new TProfile(("residual_trend_x_" + det->getName()).c_str(),
                                        titleX.c_str(), kResidualTrendNBins, 0.0, residualXMax);
             rd.profileX->SetCanExtend(TH1::kAllAxes);
+            rd.profileX->SetStats(false); // mean/RMS of the event number says nothing
 
-            std::string titleY = det->getName() + " Residual Y vs Event;Event;Local Residual Y [mm]";
+            std::string titleY = ";" + trendAxisLabel_ + ";Local Residual Y [mm]";
             rd.profileY = new TProfile(("residual_trend_y_" + det->getName()).c_str(),
                                        titleY.c_str(), kResidualTrendNBins, 0.0, residualXMax);
             rd.profileY->SetCanExtend(TH1::kAllAxes);
+            rd.profileY->SetStats(false);
+
+            if(rd.isDut) {
+                // Same binning as Tracking4D's LocalResidualsX/Y, so the DUT reads like the other planes
+                const double rx = 3 * det->getPitch().X();
+                const double ry = 3 * det->getPitch().Y();
+                rd.distX = new TH1F(("dut_residual_x_" + det->getName()).c_str(),
+                                    (det->getName() + " Local Residual X;x_{track}-x_{hit} [mm];events").c_str(),
+                                    500, -rx, rx);
+                rd.distY = new TH1F(("dut_residual_y_" + det->getName()).c_str(),
+                                    (det->getName() + " Local Residual Y;y_{track}-y_{hit} [mm];events").c_str(),
+                                    500, -ry, ry);
+            }
 
             residualTrendData_.push_back(rd);
         }
@@ -182,36 +161,29 @@ void OnlineMonitor::initialize() {
     timelineNBins_ = 200;
     const double xMax = static_cast<double>(timelineNBins_ * updateNumber);
 
-    static const Color_t kDetColors[] = {
-        kRed + 1, kBlue + 1, kGreen + 2, kOrange + 7, kMagenta + 1, kCyan + 2, kViolet + 1, kTeal + 1};
-    int colorIdx = 0;
-
     for(auto& det : get_detectors()) {
         if(ignoreAux && det->isAuxiliary()) continue;
         if(det->hasRole(DetectorRole::PASSIVE)) continue;
 
-        // X-axis is eventCounterLabel_ (what eventNumber counts); "Clusters / Event" on the Y-axis
-        // deliberately keeps "Event" meaning "one run() call" -- that is what is actually being
-        // averaged per bin, independent of what eventNumber's own units are (see run()/EventCounterMode).
+        // X-axis is every l1id (runCount_), so a plane that stops shows as its own line dropping
+        // to 0 while the others carry on; "Clusters / Event" averages over the same l1ids.
         auto* prof = new TProfile(("hits_tl_" + det->getName()).c_str(),
-                                  (";" + eventCounterLabel_ + ";Clusters / Event").c_str(),
+                                  (";" + trendAxisLabel_ + ";Clusters / Event").c_str(),
                                   timelineNBins_, 0.0, xMax);
         prof->SetCanExtend(TH1::kAllAxes);
         GuiDisplay::TimelineData td;
         td.detectorName = det->getName();
         td.profile = prof;
-        td.color = kDetColors[colorIdx++ % 8];
+        td.color = gui->detectorColors_[det->getName()];
         gui->timelineHitData_.push_back(td);
     }
 
     profile_tracks_ = new TProfile(
-        "tracks_tl", (";" + eventCounterLabel_ + ";Tracks / Event").c_str(), timelineNBins_, 0.0, xMax);
+        "tracks_tl", (";" + trendAxisLabel_ + ";Tracks / Event").c_str(), timelineNBins_, 0.0, xMax);
     profile_tracks_->SetCanExtend(TH1::kAllAxes);
     gui->timelineTrackProfile_ = profile_tracks_;
 
     // Correlation trend profiles: mean(global_pos_i - global_pos_ref) vs event number
-    static const Color_t kCorrColors[] = {kRed+1, kBlue+1, kGreen+2, kOrange+7, kMagenta+1, kCyan+2};
-    int cIdx = 0;
     auto refDet = get_reference();
     if(refDet) {
         for(auto& det : get_detectors()) {
@@ -219,18 +191,18 @@ void OnlineMonitor::initialize() {
             if(det->hasRole(DetectorRole::PASSIVE)) continue;
             if(det->getName() == refDet->getName()) continue;
 
-            GuiDisplay::CorrelationTrendData cd;
+            GuiDisplay::TrendData cd;
             cd.detectorName = det->getName();
-            cd.color = kCorrColors[cIdx++ % 6];
+            cd.color = gui->detectorColors_[det->getName()];
 
             std::string titleX =
-                ";" + eventCounterLabel_ + ";#Delta X_{global} [mm] (" + det->getName() + " - " + refDet->getName() + ")";
+                ";" + trendAxisLabel_ + ";#Delta X_{global} [mm] (" + det->getName() + " - " + refDet->getName() + ")";
             cd.profileX = new TProfile(("corr_x_tl_" + det->getName()).c_str(),
                                        titleX.c_str(), timelineNBins_, 0.0, xMax);
             cd.profileX->SetCanExtend(TH1::kAllAxes);
 
             std::string titleY =
-                ";" + eventCounterLabel_ + ";#Delta Y_{global} [mm] (" + det->getName() + " - " + refDet->getName() + ")";
+                ";" + trendAxisLabel_ + ";#Delta Y_{global} [mm] (" + det->getName() + " - " + refDet->getName() + ")";
             cd.profileY = new TProfile(("corr_y_tl_" + det->getName()).c_str(),
                                        titleY.c_str(), timelineNBins_, 0.0, xMax);
             cd.profileY->SetCanExtend(TH1::kAllAxes);
@@ -239,38 +211,9 @@ void OnlineMonitor::initialize() {
         }
     }
 
-    // Telescope view: collect detector z positions and spatial extent
-    {
-        double zMin = std::numeric_limits<double>::max();
-        double zMax = std::numeric_limits<double>::lowest();
-        double xHalf = 0.0, yHalf = 0.0;
-        for(auto& det : get_detectors()) {
-            if(ignoreAux && det->isAuxiliary()) continue;
-            if(det->hasRole(DetectorRole::PASSIVE)) continue;
-            double z = det->displacement().z();
-            telescopeDetZ_.push_back(z);
-            zMin = std::min(zMin, z);
-            zMax = std::max(zMax, z);
-            auto sz = det->getSize();
-            xHalf = std::max(xHalf, std::abs(det->displacement().x()) + sz.x() * 0.6);
-            yHalf = std::max(yHalf, std::abs(det->displacement().y()) + sz.y() * 0.6);
-        }
-        if(!telescopeDetZ_.empty()) {
-            double zMargin = std::max(1.0, (zMax - zMin) * 0.05);
-            xHalf = std::max(xHalf, 5.0);
-            yHalf = std::max(yHalf, 5.0);
-            telescopeHitXZ_ = new TH2F("tel_xz", ";z [mm];x [mm]",
-                                       300, zMin - zMargin, zMax + zMargin,
-                                       200, -xHalf, xHalf);
-            telescopeHitYZ_ = new TH2F("tel_yz", ";z [mm];y [mm]",
-                                       300, zMin - zMargin, zMax + zMargin,
-                                       200, -yHalf, yHalf);
-            gui->telescopeHitXZ = telescopeHitXZ_;
-            gui->telescopeHitYZ = telescopeHitYZ_;
-        }
-    }
-
     gui->saveDir_ = autoSaveDir_;
+    gui->maxDisplayBins1D_ = config_.get<int>("display_max_bins_1d");
+    gui->maxDisplayBins2D_ = config_.get<int>("display_max_bins_2d");
     lastAutoSaveTime_ = std::chrono::steady_clock::now();
 }
 
@@ -280,33 +223,21 @@ StatusCode OnlineMonitor::run(const std::shared_ptr<Clipboard>& clipboard) {
     fillResidualTrend(clipboard);
 
     // runCount_ (one per run() call) stays the denominator for all rate-style metrics computed in
-    // gui_update() below; eventNumber (displayed Events count) advances by whatever event_counter_
-    // selects, and can therefore jump by more than one -- or not at all -- per call.
+    // gui_update() below; eventNumber (displayed Events count) only advances when this event's
+    // l1id coincides on every reference plane.
     runCount_++;
-    eventNumber += computeEventIncrement(clipboard);
+    if(isCoincidentEvent(clipboard)) {
+        eventNumber++;
+    }
 
     gui_update();
     return StatusCode::Success;
 }
 
-int OnlineMonitor::computeEventIncrement(const std::shared_ptr<Clipboard>& clipboard) {
-    switch(eventCounterMode_) {
-    case EventCounterMode::RunCount:
-        return 1;
-    case EventCounterMode::Tracks:
-        return static_cast<int>(clipboard->getData<Track>().size());
-    case EventCounterMode::DutAssociatedTracks: {
-        int n = 0;
-        for(auto& track : clipboard->getData<Track>()) {
-            if(!track->getAssociatedClusters(eventCounterDut_).empty()) {
-                n++;
-            }
-        }
-        return n;
-    }
-    default:
-        return 1; // unreachable -- all EventCounterMode values are handled above
-    }
+bool OnlineMonitor::isCoincidentEvent(const std::shared_ptr<Clipboard>& clipboard) const {
+    return std::all_of(coincidencePlanes_.begin(), coincidencePlanes_.end(), [&](const std::string& name) {
+        return !clipboard->getData<Pixel>(name).empty();
+    });
 }
 
 void OnlineMonitor::AddCanvasGroup(std::string group_title) {
@@ -442,7 +373,16 @@ void OnlineMonitor::AddHisto(string canvasName, string histoName, string style, 
     // Add root directory to path:
     histoName = "/" + histoName;
 
-    TH1* histogram = static_cast<TH1*>(gDirectory->Get(histoName.c_str()));
+    // dynamic_cast, not static_cast: a path can legitimately point at something that is not a
+    // TH1 (AnalysisEfficiency's TEfficiency objects, for one), and casting those blindly hands
+    // the GUI a bogus pointer that only shows up as a crash much later.
+    TObject* object = gDirectory->Get(histoName.c_str());
+    TH1* histogram = dynamic_cast<TH1*>(object);
+    if(object != nullptr && histogram == nullptr) {
+        LOG(WARNING) << "Object " << histoName << " is a " << object->ClassName()
+                     << ", not a histogram -- cannot be shown on a canvas";
+        return;
+    }
     if(histogram) {
         // Allow 1D histograms to extend their x-axis when data exceeds the initial range
         if(!dynamic_cast<TH2*>(histogram)) {
@@ -451,6 +391,16 @@ void OnlineMonitor::AddHisto(string canvasName, string histoName, string style, 
         gui->histograms[canvasName].push_back(histogram);
         gui->logarithmic[gui->histograms[canvasName].back()] = logy;
         gui->styles[gui->histograms[canvasName].back()] = style;
+
+        // Tag the histogram with its plane, so the GUI can draw it in that plane's
+        // colour. A path matching no detector is a telescope-wide quantity
+        // (trackChi2, tracksPerEvent, ...) and gets the accent colour instead.
+        for(auto& detector : get_detectors()) {
+            if(histoName.find(detector->getName()) != std::string::npos) {
+                gui->histoDetector_[histogram] = detector->getName();
+                break;
+            }
+        }
     } else {
         LOG(WARNING) << "Histogram " << histoName << " does not exist";
     }
@@ -481,6 +431,19 @@ void OnlineMonitor::gui_run() {
     // Make the GUI
     gui = new GuiDisplay(gClient->GetRoot(), 1200, 600);
 
+    // Assign each plane its colour before any plot is registered below, so AddHisto
+    // can tag histograms with it. Every canvas draws from this one map.
+    size_t detColorIdx = 0;
+    for(auto& det : get_detectors()) {
+        if(ignoreAux && det->isAuxiliary()) {
+            continue;
+        }
+        if(det->hasRole(DetectorRole::PASSIVE)) {
+            continue;
+        }
+        gui->detectorColors_[det->getName()] = GuiDisplay::PaletteColor(detColorIdx++);
+    }
+
     // Make the main window object and set the attributes
     gui->buttonMenu = new TGHorizontalFrame(gui, 1200, 50);
     gui->canvas = new TRootEmbeddedCanvas("canvas", gui, 1200, 600);
@@ -488,34 +451,49 @@ void OnlineMonitor::gui_run() {
     gui->SetCleanup(kDeepCleanup);
     gui->DontCallClose();
 
-    // Add canvases and histograms
+    // Add canvases and histograms. canvasOrder_ follows the button order, so the digit keys
+    // (1-9) reach the first nine canvases as they appear on screen.
     AddCanvasGroup("Tracking");
     AddCanvas("Overview", "Tracking", canvas_overview);
     gui->canvasOrder_.push_back("OverviewCanvas");
     AddCanvas("Tracking Performance", "Tracking", canvas_tracking);
     gui->canvasOrder_.push_back("Tracking PerformanceCanvas");
-    AddCanvas("Residuals", "Tracking", canvas_residuals, true);
-    gui->canvasOrder_.push_back("ResidualsCanvas");
+    AddCanvas("Residuals X", "Tracking", canvas_residuals, true);
+    gui->canvasOrder_.push_back("Residuals XCanvas");
+    AddCanvas("Residuals Y", "Tracking", canvas_residuals_y, true);
+    gui->canvasOrder_.push_back("Residuals YCanvas");
+    // Bare lines on the residual canvases: error bars and a marker per bin cost ~10x the redraw
+    // time on these many-pad canvases. Plots given an explicit draw option keep it.
+    for(const auto* canvasName : {"Residuals XCanvas", "Residuals YCanvas"}) {
+        for(auto* h : gui->histograms[canvasName]) {
+            if(gui->styles[h].empty()) {
+                gui->styles[h] = GuiDisplay::LineStyle();
+            }
+        }
+    }
 
     // Residual-vs-event trend: OnlineMonitor's own live TProfiles (residualTrendData_, filled in
-    // fillResidualTrend()). Added individually rather than through canvas_residuals/%DETECTOR%,
-    // since that matrix is tied to this canvas's ignoreDut=true above and DUTs should appear here.
+    // fillResidualTrend()), every plane including DUTs overlaid on one canvas like Corr Trends --
+    // X on top, Y below -- so the planes can be compared at a glance.
     for(auto& rd : residualTrendData_) {
-        AddHisto("ResidualsCanvas", "OnlineMonitor/residual_trend_x_" + rd.detectorName);
-        AddHisto("ResidualsCanvas", "OnlineMonitor/residual_trend_y_" + rd.detectorName);
+        GuiDisplay::TrendData td;
+        td.detectorName = rd.detectorName;
+        td.profileX = rd.profileX;
+        td.profileY = rd.profileY;
+        td.color = gui->detectorColors_[rd.detectorName];
+        gui->residualTrendData_.push_back(td);
     }
+    gui->buttons["ResTrends"] = new TGTextButton(gui->buttonGroups["Tracking"], "Res Trends");
+    gui->buttonGroups["Tracking"]->AddFrame(gui->buttons["ResTrends"],
+                                            new TGLayoutHints(kLHintsTop | kLHintsExpandX, 0, 0, 0, 0));
+    gui->buttons["ResTrends"]->Connect("Pressed()", "corryvreckan::GuiDisplay", gui, "DisplayResidualTrend()");
+    gui->canvasOrder_.push_back("ResidualTrendCanvas");
 
     gui->buttons["Timeline"] = new TGTextButton(gui->buttonGroups["Tracking"], "Timeline");
     gui->buttonGroups["Tracking"]->AddFrame(gui->buttons["Timeline"],
                                             new TGLayoutHints(kLHintsTop | kLHintsExpandX, 0, 0, 0, 0));
     gui->buttons["Timeline"]->Connect("Pressed()", "corryvreckan::GuiDisplay", gui, "DisplayTimeline()");
     gui->canvasOrder_.push_back("TimelineCanvas");
-
-    gui->buttons["Telescope"] = new TGTextButton(gui->buttonGroups["Tracking"], "Telescope");
-    gui->buttonGroups["Tracking"]->AddFrame(gui->buttons["Telescope"],
-                                            new TGLayoutHints(kLHintsTop | kLHintsExpandX, 0, 0, 0, 0));
-    gui->buttons["Telescope"]->Connect("Pressed()", "corryvreckan::GuiDisplay", gui, "DisplayTelescope()");
-    gui->canvasOrder_.push_back("TelescopeCanvas");
 
     gui->buttons["CorrTrends"] = new TGTextButton(gui->buttonGroups["Tracking"], "Corr Trends");
     gui->buttonGroups["Tracking"]->AddFrame(gui->buttons["CorrTrends"],
@@ -528,8 +506,12 @@ void OnlineMonitor::gui_run() {
     gui->canvasOrder_.push_back("HitmapsCanvas");
     AddCanvas("Event Times", "Detectors", canvas_time);
     gui->canvasOrder_.push_back("Event TimesCanvas");
-    AddCanvas("Charge Distributions", "Detectors", canvas_charge);
-    gui->canvasOrder_.push_back("Charge DistributionsCanvas");
+    AddCanvas("Cluster Size", "Detectors", canvas_cluster_size);
+    gui->canvasOrder_.push_back("Cluster SizeCanvas");
+    // Cluster sizes 1-8 only: the histogram runs to 99, and MALTA2 clusters are rarely above a few pixels
+    for(auto* h : gui->histograms["Cluster SizeCanvas"]) {
+        gui->fixedXRange_[h] = {0.5, 8.5};
+    }
 
     // L1idC / event-time monitoring canvas
     {
@@ -575,9 +557,12 @@ void OnlineMonitor::gui_run() {
     gui->buttons["pause"]->Connect("Pressed()", "corryvreckan::GuiDisplay", gui, "TogglePause()");
     gui->buttonGroups["Controls"]->AddFrame(gui->buttons["pause"], new TGLayoutHints(kLHintsTop | kLHintsExpandX));
 
-    // Full Screen button
+    // Full Screen button. Pale enough that the black label stays readable -- and via
+    // GetColorByName, since the previous steel blue was a colour index cast to Pixel_t,
+    // which is a different thing entirely and only happened to come out blue.
+    gClient->GetColorByName("#a8c8e8", color);
     gui->buttons["fullscreen"] = new TGTextButton(gui->buttonGroups["Controls"], "&Full Screen");
-    gui->buttons["fullscreen"]->ChangeBackground(static_cast<Pixel_t>(TColor::GetColor(70, 130, 180)));
+    gui->buttons["fullscreen"]->ChangeBackground(color);
     gui->buttons["fullscreen"]->Connect("Pressed()", "corryvreckan::GuiDisplay", gui, "FullScreen()");
     gui->buttonGroups["Controls"]->AddFrame(gui->buttons["fullscreen"], new TGLayoutHints(kLHintsTop | kLHintsExpandX));
 
@@ -590,7 +575,7 @@ void OnlineMonitor::gui_run() {
 
     // Status bar at the bottom
     gui->statusBar = new TGStatusBar(gui, 1200, 22, kHorizontalFrame);
-    Int_t statusParts[] = {50, 30, 20};
+    Int_t statusParts[] = {45, 35, 20};
     gui->statusBar->SetParts(statusParts, 3);
     gui->statusBar->SetText("  Events: 0   |   Rate: 0.0 evt/s", 0);
     gui->statusBar->SetText("  Canvas: Overview", 1);
@@ -613,7 +598,7 @@ void OnlineMonitor::gui_run() {
     gui->AddFrame(gui->progressFrame, new TGLayoutHints(kLHintsExpandX, 5, 5, 2, 2));
     gui->AddFrame(gui->statusBar, new TGLayoutHints(kLHintsBottom | kLHintsExpandX));
 
-    // Keyboard shortcuts: bind keys and store keycode→action map
+    // Keyboard shortcuts: bind keys and store keycode->action map
     auto bindKey = [&](EKeySym sym, const std::string& action) {
         auto kc = static_cast<Long_t>(gVirtualX->KeysymToKeycode(sym));
         gui->BindKey(gui, static_cast<Int_t>(kc), 0);
@@ -636,10 +621,8 @@ void OnlineMonitor::gui_run() {
     // Draw the main frame
     gui->MapWindow();
 
-    // Plot the overview tab (if it exists)
-    if(gui->histograms["OverviewCanvas"].size() != 0) {
-        gui->Display(const_cast<char*>(std::string("OverviewCanvas").c_str()));
-    }
+    // Open on the Overview
+    gui->Display(const_cast<char*>("OverviewCanvas"));
 
     gui->canvas->GetCanvas()->Paint();
     gui->canvas->GetCanvas()->Update();
@@ -649,131 +632,22 @@ void OnlineMonitor::gui_run() {
     eventNumber = 0;
     runCount_ = 0;
     lastUpdateTime_ = std::chrono::steady_clock::now();
-    lastUpdateEventNumber_ = 0;
     lastUpdateRunCount_ = 0;
+    lastRedrawRunCount_ = 0;
     eventRate_ = 0.0;
-}
-
-void OnlineMonitor::checkWarningMode() {
-    if(warningMinClustersPerEvent_ <= 0.0 && warningMinTracksPerEvent_ <= 0.0) return;
-
-    auto now = std::chrono::steady_clock::now();
-
-    // Compute average clusters/event across all planes
-    double avgClusters = 0.0;
-    int nPlanes = 0;
-    for(auto& [name, accum] : warnClusterAccum_) {
-        if(warnEventAccum_ > 0) {
-            avgClusters += static_cast<double>(accum) / warnEventAccum_;
-            nPlanes++;
-        }
-        warnClusterAccum_[name] = 0;
-    }
-    if(nPlanes > 0) avgClusters /= nPlanes;
-
-    // Compute tracks/event
-    double tracksPerEvent = 0.0;
-    if(warnEventAccum_ > 0) {
-        tracksPerEvent = static_cast<double>(warnTrackAccum_) / warnEventAccum_;
-    }
-    warnTrackAccum_ = 0;
-    warnEventAccum_ = 0;
-
-    // Check if any enabled threshold is breached (skip very early startup). Uses runCount_, not
-    // eventNumber: this is a "have we processed enough real readouts yet" guard, which stays a
-    // run()-count concept regardless of eventCounterMode_ (eventNumber could advance far slower than
-    // runCount_, e.g. eventCounterMode_=="tracks" with a low tracking rate).
-    bool clustersBreach = (warningMinClustersPerEvent_ > 0.0) && (nPlanes > 0) &&
-                          (avgClusters < warningMinClustersPerEvent_) && (runCount_ > updateNumber * 2);
-    bool tracksBreach = (warningMinTracksPerEvent_ > 0.0) &&
-                        (tracksPerEvent < warningMinTracksPerEvent_) && (runCount_ > updateNumber * 2);
-    bool belowThreshold = clustersBreach || tracksBreach;
-
-    if(belowThreshold) {
-        if(!warningInitiated_) {
-            warningInitiated_ = true;
-            warningBelowSince_ = now;
-            LOG(WARNING) << "Low rate detected:"
-                         << " clusters/evt=" << std::fixed << std::setprecision(2) << avgClusters
-                         << " tracks/evt=" << tracksPerEvent;
-        } else if(!warningModeActive_) {
-            double elapsed = std::chrono::duration<double>(now - warningBelowSince_).count();
-            if(elapsed >= static_cast<double>(warningDuration_)) {
-                warningModeActive_ = true;
-                gui->warningActive = true;
-                LOG(WARNING) << "Warning mode ON:"
-                             << " clusters/evt=" << std::fixed << std::setprecision(2) << avgClusters
-                             << " (min=" << warningMinClustersPerEvent_ << ")"
-                             << " tracks/evt=" << tracksPerEvent
-                             << " (min=" << warningMinTracksPerEvent_ << ")";
-            }
-        }
-    } else {
-        if(warningModeActive_) {
-            warningModeActive_ = false;
-            gui->warningActive = false;
-            LOG(INFO) << "Warning mode OFF:"
-                      << " clusters/evt=" << std::fixed << std::setprecision(2) << avgClusters
-                      << " tracks/evt=" << tracksPerEvent;
-        }
-        warningInitiated_ = false;
-    }
+    lastProcessEvents_ = std::chrono::steady_clock::now();
+    lastRedrawTime_ = lastProcessEvents_;
 }
 
 void OnlineMonitor::fillTimeline(const std::shared_ptr<Clipboard>& clipboard) {
-    double ev = static_cast<double>(eventNumber);
+    double ev = static_cast<double>(runCount_); // every l1id, see runCount_
 
     for(auto& td : gui->timelineHitData_) {
-        auto& clusters = clipboard->getData<Cluster>(td.detectorName);
-        double n = static_cast<double>(clusters.size());
-        td.profile->Fill(ev, n);
-        warnClusterAccum_[td.detectorName] += static_cast<int>(clusters.size());
-
-        // Telescope: fill cluster hit positions in the z-x and z-y projections
-        if(telescopeHitXZ_ && telescopeHitYZ_) {
-            for(auto& cluster : clusters) {
-                const auto& g = cluster->global();
-                telescopeHitXZ_->Fill(g.z(), g.x());
-                telescopeHitYZ_->Fill(g.z(), g.y());
-            }
-        }
+        td.profile->Fill(ev, static_cast<double>(clipboard->getData<Cluster>(td.detectorName).size()));
     }
-    warnEventAccum_++;
 
     if(profile_tracks_) {
-        auto& tracks = clipboard->getData<Track>();
-        profile_tracks_->Fill(ev, static_cast<double>(tracks.size()));
-        warnTrackAccum_ += static_cast<int>(tracks.size());
-
-        // Telescope: store intercept points of each track at every detector plane
-        if(!telescopeDetZ_.empty()) {
-            static const Color_t kTrackPalette[GuiDisplay::kNTrackColors] = {
-                kRed, kBlue + 1, kGreen + 2, kMagenta, kCyan + 1, kOrange + 7, kViolet + 1, kTeal + 1};
-            for(auto& track : tracks) {
-                telescopeTrackCount_++;
-
-                // Reset hit histograms and track buffer when the threshold is reached
-                if(telescopeResetTracks_ > 0 && telescopeTrackCount_ >= telescopeResetTracks_) {
-                    telescopeTrackCount_ = 0;
-                    if(telescopeHitXZ_) telescopeHitXZ_->Reset();
-                    if(telescopeHitYZ_) telescopeHitYZ_->Reset();
-                    gui->telescopeTracks.clear();
-                }
-
-                GuiDisplay::TrackView tv;
-                tv.color = kTrackPalette[gui->telescopeColorIdx++ % GuiDisplay::kNTrackColors];
-                for(double z : telescopeDetZ_) {
-                    auto pt = track->getIntercept(z);
-                    tv.z.push_back(pt.z());
-                    tv.x.push_back(pt.x());
-                    tv.y.push_back(pt.y());
-                }
-                gui->telescopeTracks.push_back(std::move(tv));
-                while(gui->telescopeTracks.size() > static_cast<size_t>(GuiDisplay::kTelescopeMaxTracks)) {
-                    gui->telescopeTracks.pop_front();
-                }
-            }
-        }
+        profile_tracks_->Fill(ev, static_cast<double>(clipboard->getData<Track>().size()));
     }
 
     // After auto-extension the bin count doubles; rebin down to keep ~timelineNBins_ bins
@@ -804,7 +678,7 @@ void OnlineMonitor::fillCorrelation(const std::shared_ptr<Clipboard>& clipboard)
     double meanXRef = sumXRef / static_cast<double>(refClusters.size());
     double meanYRef = sumYRef / static_cast<double>(refClusters.size());
 
-    double ev = static_cast<double>(eventNumber);
+    double ev = static_cast<double>(runCount_); // every l1id, see runCount_
 
     for(auto& cd : gui->correlationTrendData_) {
         auto& clusters = clipboard->getData<Cluster>(cd.detectorName);
@@ -836,7 +710,7 @@ void OnlineMonitor::fillResidualTrend(const std::shared_ptr<Clipboard>& clipboar
     if(residualTrendData_.empty()) return;
 
     auto& tracks = clipboard->getData<Track>();
-    double ev = static_cast<double>(eventNumber);
+    double ev = static_cast<double>(runCount_); // every l1id, see runCount_
 
     for(auto& rd : residualTrendData_) {
         for(auto& track : tracks) {
@@ -845,13 +719,20 @@ void OnlineMonitor::fillResidualTrend(const std::shared_ptr<Clipboard>& clipboar
                 // (getLocalResidual() would throw). Compute the same quantity AnalysisDUT does:
                 // track intercept vs. the closest DUTAssociation-associated cluster, in local
                 // coordinates. No associated cluster this event -> nothing to plot (e.g. genuine
-                // DUT inefficiency), not a 0.
+                // DUT inefficiency), not a 0. getClosestCluster() throws rather than returning
+                // null for a track that has none, so this has to be guarded up front.
+                if(!track->hasClosestCluster(rd.detectorName)) {
+                    continue;
+                }
                 auto closest = track->getClosestCluster(rd.detectorName);
-                if(!closest) continue;
                 auto detector = get_detector(rd.detectorName);
                 auto intercept = detector->getLocalIntercept(track.get());
-                rd.profileX->Fill(ev, intercept.X() - closest->local().x());
-                rd.profileY->Fill(ev, intercept.Y() - closest->local().y());
+                const double resX = intercept.X() - closest->local().x();
+                const double resY = intercept.Y() - closest->local().y();
+                rd.profileX->Fill(ev, resX);
+                rd.profileY->Fill(ev, resY);
+                rd.distX->Fill(resX);
+                rd.distY->Fill(resY);
             } else {
                 // Only detectors actually used in this track's fit have a residual_local_ entry.
                 bool in_fit = false;
@@ -885,32 +766,30 @@ void OnlineMonitor::gui_update() {
     auto now = std::chrono::steady_clock::now();
     double wallElapsed = std::chrono::duration<double>(now - lastUpdateTime_).count();
 
-    // Trigger display update once eventNumber has advanced by at least updateNumber since the last
-    // update (a delta check rather than eventNumber % updateNumber == 0: eventCounterMode_ can advance
-    // eventNumber by more than one -- or not at all -- per run() call, so an exact multiple could be
-    // stepped over). Rate refresh (status bar "Rate: X evt/s") every 5 s regardless, using runCount_
-    // (real event rate, independent of eventCounterMode_) rather than eventNumber.
-    bool eventCycle = !gui->isPaused() && (eventNumber - lastUpdateEventNumber_ >= updateNumber);
+    // Redraw once updateNumber l1ids have been processed since the last redraw -- every l1id, not
+    // only coincident ones, so the screen keeps moving when a plane stops -- but at most once a
+    // second, so the drawing cannot outgrow the reconstruction as the rate rises. Status bar
+    // (Events count, rate) refreshes every 5 s regardless.
+    bool eventCycle = !gui->isPaused() && (runCount_ - lastRedrawRunCount_ >= updateNumber) &&
+                      (now - lastRedrawTime_ >= std::chrono::seconds(1));
     bool wallClock = (wallElapsed >= 5.0);
 
+    bool redrawn = false;
     if(eventCycle || wallClock) {
+        redrawn = true;
         if(wallElapsed > 0) {
             eventRate_ = static_cast<double>(runCount_ - lastUpdateRunCount_) / wallElapsed;
         }
         lastUpdateTime_ = now;
-        lastUpdateEventNumber_ = eventNumber;
         lastUpdateRunCount_ = runCount_;
 
-        if(eventCycle) {
-            if(gui->currentCanvas_ == "TelescopeCanvas") {
-                gui->DisplayTelescope();
-            } else {
-                gui->Update();
-            }
-        }
         gui->updateStatus(eventNumber, eventRate_);
         gui->updateProgress(eventNumber, targetEvents_);
-        checkWarningMode();
+        if(eventCycle) {
+            gui->Update();
+            lastRedrawTime_ = now;
+            lastRedrawRunCount_ = runCount_;
+        }
 
         // Auto-save current canvas
         if(autoSaveInterval_ > 0) {
@@ -925,5 +804,12 @@ void OnlineMonitor::gui_update() {
         }
     }
 
-    gSystem->ProcessEvents();
+    // Hand control to the GUI (button presses, window exposes, flushing the drawing above to the
+    // X server) at most every 20 ms, and right after a redraw. Doing it on every run() call meant
+    // a round of X traffic per event -- thousands per second, all through the SSH tunnel.
+    auto afterDraw = std::chrono::steady_clock::now();
+    if(redrawn || afterDraw - lastProcessEvents_ >= std::chrono::milliseconds(20)) {
+        gSystem->ProcessEvents();
+        lastProcessEvents_ = afterDraw;
+    }
 }
